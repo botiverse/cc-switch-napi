@@ -10,15 +10,24 @@ process.env.CC_SWITCH_CONFIG_DIR = join(sandbox, 'cc-switch')
 process.env.CLAUDE_CONFIG_DIR = join(sandbox, 'claude')
 process.env.CODEX_HOME = join(sandbox, 'codex')
 process.env.HOME = join(sandbox, 'home')
-// `dirs::home_dir()` resolves USERPROFILE on Windows rather than HOME.
-// Keep the native live-config and skills probes inside this test sandbox on
-// every host so the same tests exercise identical paths cross-platform.
-process.env.USERPROFILE = process.env.HOME
-process.env.HOMEDRIVE = ''
-process.env.HOMEPATH = process.env.HOME
 process.env.XDG_CONFIG_HOME = join(sandbox, 'xdg-config')
 process.env.XDG_RUNTIME_DIR = join(sandbox, 'xdg-runtime')
 process.env.XDG_STATE_HOME = join(sandbox, 'xdg-state')
+
+// Rust's dirs::home_dir() ignores HOME on Windows. Use CC Switch's supported
+// per-application overrides so native MCP/Skills writes remain sandboxed on
+// every host without relying on platform-specific home-directory behavior.
+mkdirSync(process.env.CC_SWITCH_CONFIG_DIR, { recursive: true })
+writeFileSync(
+  join(process.env.CC_SWITCH_CONFIG_DIR, 'settings.json'),
+  JSON.stringify({
+    claudeConfigDir: join(sandbox, 'claude'),
+    codexConfigDir: join(sandbox, 'codex'),
+    geminiConfigDir: join(sandbox, 'gemini'),
+    opencodeConfigDir: join(sandbox, 'opencode'),
+    hermesConfigDir: join(sandbox, 'hermes'),
+  }),
+)
 
 // Upstream deliberately skips live writes for applications that have not
 // been initialized. Creating the isolated config directory opts this test's
@@ -149,7 +158,7 @@ test.serial('manages unified MCP registry and application projection', (t) => {
   client.toggleMcpApp('local-echo', 'claude', true)
   t.true(client.listMcpServers()['local-echo'].apps.claude)
 
-  const claudeMcp = JSON.parse(readFileSync(join(sandbox, 'home', '.claude.json'), 'utf8'))
+  const claudeMcp = JSON.parse(readFileSync(join(sandbox, 'claude.json'), 'utf8'))
   t.is(claudeMcp.mcpServers['local-echo'].command, 'node')
 
   t.true(client.setMcpApps('local-echo', {}))
@@ -166,7 +175,7 @@ test.serial('imports, projects, configures, and uninstalls a local Skill', (t) =
     message: /not supported for OpenClaw/,
   })
 
-  const source = join(sandbox, 'home', '.claude', 'skills', 'local-demo')
+  const source = join(sandbox, 'claude', 'skills', 'local-demo')
   mkdirSync(source, { recursive: true })
   writeFileSync(
     join(source, 'SKILL.md'),
@@ -183,9 +192,9 @@ test.serial('imports, projects, configures, and uninstalls a local Skill', (t) =
   t.true(existsSync(join(sandbox, 'cc-switch', 'skills', 'local-demo', 'SKILL.md')))
 
   client.toggleSkillApp('local-demo', 'codex', true)
-  t.true(existsSync(join(sandbox, 'home', '.codex', 'skills', 'local-demo', 'SKILL.md')))
+  t.true(existsSync(join(sandbox, 'codex', 'skills', 'local-demo', 'SKILL.md')))
   t.true(client.setSkillApps('local-demo', { claude: true }))
-  t.false(existsSync(join(sandbox, 'home', '.codex', 'skills', 'local-demo')))
+  t.false(existsSync(join(sandbox, 'codex', 'skills', 'local-demo')))
   client.syncSkillsToLive('claude')
   t.true(client.listSkills().some((skill) => skill.directory === 'local-demo'))
 
