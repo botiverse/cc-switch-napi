@@ -13,6 +13,13 @@
 export declare class CcSwitch {
   /** Opens the current CC Switch store without importing live configuration. */
   constructor()
+  /**
+   * Closes the underlying store and releases the process-wide instance slot.
+   *
+   * Call this before deleting the store directory on Windows. Further method
+   * calls on this object fail; constructing a new instance is allowed.
+   */
+  close(): void
   /** Returns every application supported by the vendored CC Switch core. */
   supportedApps(): Array<import('./api.js').AppId>
   /** Lists provider objects using the vendored CC Switch serialized shape. */

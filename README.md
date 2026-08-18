@@ -37,6 +37,7 @@ ccSwitch.removeFromLiveConfig('opencode', 'provider-id')
 ccSwitch.setDefaultProvider('openclaw', 'provider-id', 'model-id')
 ccSwitch.readLiveSettings('codex')
 ccSwitch.syncCurrentToLive()
+ccSwitch.close()
 ```
 
 `currentProvider()` is meaningful for Claude, Codex, Gemini, and Hermes. The
@@ -76,8 +77,11 @@ Live application paths follow the upstream variables, including
 Those paths are resolved from process-global environment and settings. To
 prevent stale in-memory snapshots from overwriting each other, the binding
 allows only one active `CcSwitch` instance per process. Reuse it for all
-operations, and do not change path-related environment variables while it is
-active. External processes must also avoid writing the same store while the
+operations, and call `close()` when finished to release the native store and
+allow a new instance. Closing is required before synchronously deleting the
+store on Windows; garbage collection also releases an unclosed instance
+eventually. Do not change path-related environment variables while an instance
+is active. External processes must also avoid writing the same store while the
 instance is active; the in-memory upstream state is refreshed only at
 construction. The same caution applies to external writers of live app
 configuration files while switch/sync operations are running.

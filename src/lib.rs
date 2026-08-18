@@ -39,7 +39,7 @@ fn parse_provider(value: Value) -> Result<Provider> {
 /// while an instance is active. Only one instance may exist per process.
 #[napi]
 pub struct CcSwitch {
-  state: AppState,
+  state: Option<AppState>,
 }
 
 #[napi]
@@ -58,12 +58,22 @@ impl CcSwitch {
     }
 
     match AppState::try_new() {
-      Ok(state) => Ok(Self { state }),
+      Ok(state) => Ok(Self { state: Some(state) }),
       Err(error) => {
         INSTANCE_ACTIVE.store(false, Ordering::Release);
         Err(napi_error(error))
       }
     }
+  }
+
+  /// Closes the underlying store and releases the process-wide instance slot.
+  ///
+  /// Call this before deleting the store directory on Windows. Further method
+  /// calls on this object fail; constructing a new instance is allowed.
+  #[napi]
+  pub fn close(&mut self) {
+    self.state.take();
+    INSTANCE_ACTIVE.store(false, Ordering::Release);
   }
 
   /// Returns every application supported by the vendored CC Switch core.
@@ -79,7 +89,7 @@ impl CcSwitch {
     #[napi(ts_arg_type = "import('./api.js').AppId")] app: String,
   ) -> Result<Vec<Value>> {
     let app = parse_app(&app)?;
-    ProviderService::list(&self.state, app)
+    ProviderService::list(self.state()?, app)
       .and_then(|providers| {
         providers
           .into_values()
@@ -98,7 +108,7 @@ impl CcSwitch {
     #[napi(ts_arg_type = "import('./api.js').AppId")] app: String,
   ) -> Result<Option<String>> {
     let app = parse_app(&app)?;
-    ProviderService::current(&self.state, app)
+    ProviderService::current(self.state()?, app)
       .map(|id| (!id.is_empty()).then_some(id))
       .map_err(napi_error)
   }
@@ -110,7 +120,7 @@ impl CcSwitch {
     #[napi(ts_arg_type = "import('./api.js').AppId")] app: String,
     #[napi(ts_arg_type = "import('./api.js').Provider")] provider: Value,
   ) -> Result<bool> {
-    ProviderService::add(&self.state, parse_app(&app)?, parse_provider(provider)?)
+    ProviderService::add(self.state()?, parse_app(&app)?, parse_provider(provider)?)
       .map_err(napi_error)
   }
 
@@ -121,7 +131,7 @@ impl CcSwitch {
     #[napi(ts_arg_type = "import('./api.js').AppId")] app: String,
     #[napi(ts_arg_type = "import('./api.js').Provider")] provider: Value,
   ) -> Result<bool> {
-    ProviderService::update(&self.state, parse_app(&app)?, parse_provider(provider)?)
+    ProviderService::update(self.state()?, parse_app(&app)?, parse_provider(provider)?)
       .map_err(napi_error)
   }
 
@@ -135,12 +145,17 @@ impl CcSwitch {
     provider_override: Option<Value>,
   ) -> Result<Value> {
     let provider_override = provider_override.map(parse_provider).transpose()?;
-    ProviderService::duplicate(&self.state, parse_app(&app)?, &source_id, provider_override)
-      .and_then(|provider| {
-        serde_json::to_value(provider)
-          .map_err(|source| cc_switch_lib::AppError::JsonSerialize { source })
-      })
-      .map_err(napi_error)
+    ProviderService::duplicate(
+      self.state()?,
+      parse_app(&app)?,
+      &source_id,
+      provider_override,
+    )
+    .and_then(|provider| {
+      serde_json::to_value(provider)
+        .map_err(|source| cc_switch_lib::AppError::JsonSerialize { source })
+    })
+    .map_err(napi_error)
   }
 
   /// Switches the selected provider and, when initialized, writes its live config.
@@ -150,7 +165,7 @@ impl CcSwitch {
     #[napi(ts_arg_type = "import('./api.js').AppId")] app: String,
     provider_id: String,
   ) -> Result<()> {
-    ProviderService::switch(&self.state, parse_app(&app)?, &provider_id).map_err(napi_error)
+    ProviderService::switch(self.state()?, parse_app(&app)?, &provider_id).map_err(napi_error)
   }
 
   /// Deletes a provider. CC Switch refuses to delete an active provider.
@@ -160,7 +175,7 @@ impl CcSwitch {
     #[napi(ts_arg_type = "import('./api.js').AppId")] app: String,
     provider_id: String,
   ) -> Result<()> {
-    ProviderService::delete(&self.state, parse_app(&app)?, &provider_id).map_err(napi_error)
+    ProviderService::delete(self.state()?, parse_app(&app)?, &provider_id).map_err(napi_error)
   }
 
   /// Imports providers from the application's current live configuration.
@@ -169,7 +184,7 @@ impl CcSwitch {
     &self,
     #[napi(ts_arg_type = "import('./api.js').AppId")] app: String,
   ) -> Result<u32> {
-    ProviderService::import_live_config(&self.state, parse_app(&app)?)
+    ProviderService::import_live_config(self.state()?, parse_app(&app)?)
       .and_then(|count| {
         u32::try_from(count).map_err(|_| {
           cc_switch_lib::AppError::Message("Imported provider count exceeds u32".to_string())
@@ -185,7 +200,7 @@ impl CcSwitch {
     #[napi(ts_arg_type = "import('./api.js').AppId")] app: String,
     provider_id: String,
   ) -> Result<()> {
-    ProviderService::remove_from_live_config(&self.state, parse_app(&app)?, &provider_id)
+    ProviderService::remove_from_live_config(self.state()?, parse_app(&app)?, &provider_id)
       .map_err(napi_error)
   }
 
@@ -198,7 +213,7 @@ impl CcSwitch {
     model_id: Option<String>,
   ) -> Result<String> {
     ProviderService::set_default_model(
-      &self.state,
+      self.state()?,
       parse_app(&app)?,
       &provider_id,
       model_id.as_deref(),
@@ -218,12 +233,24 @@ impl CcSwitch {
   /// Writes all currently selected providers back to their live configs.
   #[napi]
   pub fn sync_current_to_live(&self) -> Result<()> {
-    ProviderService::sync_current_to_live(&self.state).map_err(napi_error)
+    ProviderService::sync_current_to_live(self.state()?).map_err(napi_error)
+  }
+}
+
+impl CcSwitch {
+  fn state(&self) -> Result<&AppState> {
+    self.state.as_ref().ok_or_else(|| {
+      Error::new(
+        Status::GenericFailure,
+        "This CcSwitch instance has been closed".to_string(),
+      )
+    })
   }
 }
 
 impl Drop for CcSwitch {
   fn drop(&mut self) {
+    self.state.take();
     INSTANCE_ACTIVE.store(false, Ordering::Release);
   }
 }

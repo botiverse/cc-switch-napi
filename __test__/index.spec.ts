@@ -22,6 +22,7 @@ mkdirSync(process.env.CLAUDE_CONFIG_DIR, { recursive: true })
 const client = new CcSwitch()
 
 test.after.always(() => {
+  client.close()
   rmSync(sandbox, { recursive: true, force: true })
 })
 
@@ -94,4 +95,15 @@ test.serial('adds and switches a Claude provider in the isolated live config', (
   })
   client.deleteProvider('claude', provider.id)
   t.false(client.listProviders('claude').some((entry) => entry.id === provider.id))
+})
+
+test.serial('releases the store and instance slot explicitly', (t) => {
+  client.close()
+  t.throws(() => client.listProviders('claude'), {
+    message: /has been closed/,
+  })
+
+  const replacement = new CcSwitch()
+  replacement.close()
+  t.pass()
 })
