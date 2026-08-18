@@ -1,13 +1,12 @@
-name: CI
+name: Publish npm package
 
 on:
-  push:
-    branches: [main]
-  pull_request:
+  release:
+    types: [published]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -16,44 +15,6 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  lint:
-    name: Lint and type generation
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: yarn
-
-      - name: Enable Corepack
-        run: corepack enable
-
-      - name: Install Rust 1.91.1
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.91.1
-          components: clippy, rustfmt
-
-      - name: Install dependencies
-        run: yarn install --immutable
-
-      - name: Lint JavaScript and TypeScript
-        run: yarn lint
-
-      - name: Check TypeScript declarations
-        run: yarn tsc --noEmit
-
-      - name: Check test TypeScript
-        run: yarn tsc -p __test__/tsconfig.json --noEmit
-
-      - name: Check Rust formatting
-        run: cargo fmt --check
-
-      - name: Check Rust lints
-        run: cargo clippy --all-targets -- -D warnings
-
   build:
     name: Build ${{ matrix.target }}
     strategy:
@@ -131,3 +92,44 @@ jobs:
           name: bindings-${{ matrix.target }}
           path: cc-switch-napi.*.node
           if-no-files-found: error
+
+  publish:
+    name: Publish @botiverse/cc-switch
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: yarn
+          registry-url: https://registry.npmjs.org
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Verify release tag matches package version
+        run: node -e "const p=require('./package.json'); if (process.env.GITHUB_REF_NAME !== 'v' + p.version) throw new Error('Release tag must equal v' + p.version)"
+
+      - name: Create platform packages
+        run: yarn napi create-npm-dirs
+
+      - name: Download native bindings
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Assemble npm packages
+        run: yarn artifacts
+
+      - name: Publish package with npm Trusted Publisher
+        run: npm publish --access public --provenance
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
