@@ -10,6 +10,12 @@ process.env.CC_SWITCH_CONFIG_DIR = join(sandbox, 'cc-switch')
 process.env.CLAUDE_CONFIG_DIR = join(sandbox, 'claude')
 process.env.CODEX_HOME = join(sandbox, 'codex')
 process.env.HOME = join(sandbox, 'home')
+// `dirs::home_dir()` resolves USERPROFILE on Windows rather than HOME.
+// Keep the native live-config and skills probes inside this test sandbox on
+// every host so the same tests exercise identical paths cross-platform.
+process.env.USERPROFILE = process.env.HOME
+process.env.HOMEDRIVE = ''
+process.env.HOMEPATH = process.env.HOME
 process.env.XDG_CONFIG_HOME = join(sandbox, 'xdg-config')
 process.env.XDG_RUNTIME_DIR = join(sandbox, 'xdg-runtime')
 process.env.XDG_STATE_HOME = join(sandbox, 'xdg-state')
