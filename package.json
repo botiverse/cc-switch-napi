@@ -1,7 +1,7 @@
 {
   "name": "@botiverse/cc-switch",
-  "version": "0.1.1",
-  "description": "Native Node.js bindings for CC Switch provider management",
+  "version": "0.2.0",
+  "description": "Native Node.js bindings for CC Switch provider, MCP, and Skills management",
   "main": "index.js",
   "types": "api.d.ts",
   "repository": {
@@ -21,7 +21,9 @@
     "node-addon-api",
     "claude-code",
     "codex",
-    "provider-switch"
+    "provider-switch",
+    "mcp",
+    "skills"
   ],
   "files": [
     "api.d.ts",

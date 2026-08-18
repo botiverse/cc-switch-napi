@@ -557,12 +557,13 @@ dependencies = [
 
 [[package]]
 name = "cc-switch-napi"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "cc-switch",
  "napi",
  "napi-build",
  "napi-derive",
+ "serde",
  "serde_json",
 ]
 
@@ -2147,6 +2148,7 @@ dependencies = [
  "rustc-hash",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

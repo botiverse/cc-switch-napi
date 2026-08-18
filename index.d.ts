@@ -66,4 +66,60 @@ export declare class CcSwitch {
   clearCommonConfig(app: import('./api.js').AppId): void
   /** Writes all currently selected providers back to their live configs. */
   syncCurrentToLive(): void
+  /** Returns applications that support MCP projection. */
+  supportedMcpApps(): Array<import('./api.js').McpAppId>
+  /** Lists the unified MCP server registry keyed by server id. */
+  listMcpServers(): Record<string, import('./api.js').McpServer>
+  /** Adds or replaces an MCP server and projects it to enabled applications. */
+  upsertMcpServer(server: import('./api.js').McpServer): void
+  /** Deletes an MCP server from the registry and every enabled live config. */
+  deleteMcpServer(serverId: string): boolean
+  /** Enables or disables one MCP server for one supported application. */
+  toggleMcpApp(serverId: string, app: import('./api.js').McpAppId, enabled: boolean): void
+  /** Replaces the complete application matrix for an MCP server. */
+  setMcpApps(serverId: string, apps: import('./api.js').McpApps): boolean
+  /** Projects enabled MCP servers to every supported app, or to one app. */
+  syncMcpToLive(app?: import('./api.js').McpAppId | null | undefined): void
+  /** Imports MCP servers from one supported app, or from every supported app. */
+  importMcpFromLive(app?: import('./api.js').McpAppId | null | undefined): number
+  /** Returns applications that support managed Skills. */
+  supportedSkillApps(): Array<import('./api.js').SkillAppId>
+  /** Lists installed managed Skills. */
+  listSkills(): Array<import('./api.js').InstalledSkill>
+  /** Installs a Skill from an upstream-supported spec and enables it for one app. */
+  installSkill(spec: string, app: import('./api.js').SkillAppId): Promise<import('./api.js').InstalledSkill>
+  /** Uninstalls a managed Skill from the SSOT and all application directories. */
+  uninstallSkill(directoryOrId: string): void
+  /** Enables or disables one installed Skill for one application. */
+  toggleSkillApp(directoryOrId: string, app: import('./api.js').SkillAppId, enabled: boolean): void
+  /** Replaces the complete application matrix for an installed Skill. */
+  setSkillApps(directoryOrId: string, apps: import('./api.js').SkillApps): boolean
+  /** Synchronizes enabled Skills to every supported app, or to one app. */
+  syncSkillsToLive(app?: import('./api.js').SkillAppId | null | undefined): void
+  /** Scans application directories for Skills not yet managed by CC Switch. */
+  scanUnmanagedSkills(): Array<import('./api.js').UnmanagedSkill>
+  /** Imports unmanaged Skills with an explicit per-Skill application matrix. */
+  importSkills(selections: Array<import('./api.js').ImportSkillSelection>): Array<import('./api.js').InstalledSkill>
+  /** Lists configured Skill repositories. */
+  listSkillRepos(): Array<import('./api.js').SkillRepo>
+  /** Adds or replaces a Skill repository. */
+  upsertSkillRepo(repo: import('./api.js').SkillRepo): void
+  /** Removes a Skill repository by owner/name. */
+  removeSkillRepo(owner: string, name: string): void
+  /** Returns the configured Skill deployment strategy. */
+  skillSyncMethod(): import('./api.js').SkillSyncMethod
+  /** Sets the Skill deployment strategy: auto, symlink, or copy. */
+  setSkillSyncMethod(method: import('./api.js').SkillSyncMethod): void
+  /** Discovers installable Skills from configured repositories. */
+  discoverSkills(forceRefresh?: boolean | undefined | null): Promise<Array<import('./api.js').DiscoverableSkill>>
+  /** Searches the skills.sh catalog using the vendored upstream client. */
+  searchSkills(
+    query: string,
+    limit?: number | undefined | null,
+    offset?: number | undefined | null,
+  ): Promise<import('./api.js').SkillSearchResult>
+  /** Checks installed repository-backed Skills for content updates. */
+  checkSkillUpdates(): Promise<import('./api.js').SkillUpdateCheckResult>
+  /** Updates selected installed Skills and reports per-Skill failures. */
+  updateSkills(ids: Array<string>): Promise<import('./api.js').SkillUpdateBatchResult>
 }

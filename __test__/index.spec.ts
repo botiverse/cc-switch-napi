@@ -1,5 +1,5 @@
 import test from 'ava'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -119,6 +119,79 @@ test.serial('exposes default import and non-sensitive common-config operations',
   client.setCommonConfig('claude', snippet)
   client.clearCommonConfig('claude')
   t.false(client.importDefaultConfig('opencode'))
+})
+
+test.serial('manages unified MCP registry and application projection', (t) => {
+  t.deepEqual(client.supportedMcpApps(), ['claude', 'codex', 'gemini', 'opencode', 'hermes'])
+
+  client.upsertMcpServer({
+    id: 'local-echo',
+    name: 'Local Echo',
+    server: {
+      command: 'node',
+      args: ['echo.js'],
+      env: { TEST_MODE: '1' },
+    },
+    apps: {},
+    tags: ['test'],
+  })
+
+  t.is(client.listMcpServers()['local-echo'].name, 'Local Echo')
+  t.throws(() => client.toggleMcpApp('local-echo', 'openclaw' as never, true), {
+    message: /not supported for OpenClaw/,
+  })
+  client.toggleMcpApp('local-echo', 'claude', true)
+  t.true(client.listMcpServers()['local-echo'].apps.claude)
+
+  const claudeMcp = JSON.parse(readFileSync(join(sandbox, 'home', '.claude.json'), 'utf8'))
+  t.is(claudeMcp.mcpServers['local-echo'].command, 'node')
+
+  t.true(client.setMcpApps('local-echo', {}))
+  t.false(client.listMcpServers()['local-echo'].apps.claude)
+  t.true(client.deleteMcpServer('local-echo'))
+  t.false('local-echo' in client.listMcpServers())
+})
+
+test.serial('imports, projects, configures, and uninstalls a local Skill', (t) => {
+  t.deepEqual(client.supportedSkillApps(), ['claude', 'codex', 'gemini', 'opencode', 'hermes'])
+  client.setSkillSyncMethod('copy')
+  t.is(client.skillSyncMethod(), 'copy')
+  t.throws(() => client.syncSkillsToLive('openclaw' as never), {
+    message: /not supported for OpenClaw/,
+  })
+
+  const source = join(sandbox, 'home', '.claude', 'skills', 'local-demo')
+  mkdirSync(source, { recursive: true })
+  writeFileSync(
+    join(source, 'SKILL.md'),
+    '---\nname: Local Demo\ndescription: Isolated SDK test skill\n---\n\n# Local Demo\n',
+  )
+
+  const unmanaged = client.scanUnmanagedSkills().find((skill) => skill.directory === 'local-demo')
+  t.truthy(unmanaged)
+  t.true(unmanaged?.foundIn.includes('claude'))
+
+  const [imported] = client.importSkills([{ directory: 'local-demo', apps: { claude: true } }])
+  t.is(imported.directory, 'local-demo')
+  t.true(imported.apps.claude)
+  t.true(existsSync(join(sandbox, 'cc-switch', 'skills', 'local-demo', 'SKILL.md')))
+
+  client.toggleSkillApp('local-demo', 'codex', true)
+  t.true(existsSync(join(sandbox, 'home', '.codex', 'skills', 'local-demo', 'SKILL.md')))
+  t.true(client.setSkillApps('local-demo', { claude: true }))
+  t.false(existsSync(join(sandbox, 'home', '.codex', 'skills', 'local-demo')))
+  client.syncSkillsToLive('claude')
+  t.true(client.listSkills().some((skill) => skill.directory === 'local-demo'))
+
+  client.uninstallSkill('local-demo')
+  t.false(client.listSkills().some((skill) => skill.directory === 'local-demo'))
+  t.false(existsSync(join(sandbox, 'cc-switch', 'skills', 'local-demo')))
+})
+
+test.serial('runs network-backed Skill APIs on the native async runtime', async (t) => {
+  await t.throwsAsync(() => client.installSkill('', 'claude'), {
+    message: /Skill/,
+  })
 })
 
 test.serial('releases the store and instance slot explicitly', (t) => {

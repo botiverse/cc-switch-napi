@@ -1,8 +1,8 @@
 # Binding coverage
 
-The package binds the provider-management and provider-switching data plane of
-the vendored CC Switch revision. It does not attempt to expose every feature of
-the full desktop/TUI application.
+The package binds the provider-switching, unified MCP, and managed Skills data
+planes of the vendored CC Switch revision. It does not attempt to expose every
+feature of the full desktop/TUI application.
 
 ## Bound
 
@@ -17,10 +17,18 @@ the full desktop/TUI application.
 | Read/sync live settings          | `readLiveSettings`, `syncCurrentToLive`                                                          |
 | Common config extraction/storage | `extractCommonConfig`, `extractCommonConfigFromSettings`, `setCommonConfig`, `clearCommonConfig` |
 | Safe native lifecycle            | constructor, `close`                                                                             |
+| MCP registry CRUD                | `listMcpServers`, `upsertMcpServer`, `deleteMcpServer`                                           |
+| MCP app matrix/live projection   | `toggleMcpApp`, `setMcpApps`, `syncMcpToLive`, `importMcpFromLive`                               |
+| Installed Skills                 | `listSkills`, `installSkill`, `uninstallSkill`                                                   |
+| Skill app matrix/live projection | `toggleSkillApp`, `setSkillApps`, `syncSkillsToLive`                                             |
+| Unmanaged Skill import           | `scanUnmanagedSkills`, `importSkills`                                                            |
+| Skill repositories/sync mode     | `listSkillRepos`, `upsertSkillRepo`, `removeSkillRepo`, `skillSyncMethod`, `setSkillSyncMethod`  |
+| Skill discovery/search/update    | `discoverSkills`, `searchSkills`, `checkSkillUpdates`, `updateSkills`                            |
 
-These methods cover the upstream `ProviderService` state transitions required
-to create providers, select them, persist them, and synchronize application
-configuration for all six supported applications.
+These methods cover the upstream `ProviderService`, `McpService`, and core
+`SkillService` state transitions required to persist and synchronize those
+three data planes. MCP and Skills target Claude, Codex, Gemini, OpenCode, and
+Hermes; the pinned upstream does not support projecting either into OpenClaw.
 
 ## Available through existing objects
 
@@ -40,8 +48,8 @@ state transitions, and remain outside this package's current contract:
 - endpoint speed tests and streaming health checks;
 - remote model discovery;
 - quota and usage-script execution;
-- proxy lifecycle, failover routing, sessions, OAuth, MCP, prompts, skills,
-  WebDAV/S3 sync, daemon management, and desktop/TUI commands;
+- proxy lifecycle, failover routing, sessions, OAuth, prompts, WebDAV/S3 sync,
+  daemon management, and desktop/TUI commands;
 - CLI-only provider templates and standalone export formatting.
 
 Adding one of these requires a separate typed API and async/cancellation design;
@@ -50,7 +58,8 @@ it should not be smuggled into the synchronous switching surface.
 ## Verification
 
 - Source tests run against isolated HOME/config directories and never touch a
-  developer's real application configuration.
+  developer's real application configuration. They verify MCP registry/live
+  projection plus local Skill scan/import/app projection/uninstall.
 - Release CI builds six native targets and executes tests on native runners.
 - After publishing, release CI installs the exact npm version on Linux, macOS,
   and Windows, loads the selected native package, opens an isolated store, and

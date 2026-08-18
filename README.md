@@ -1,6 +1,6 @@
 # @botiverse/cc-switch
 
-Native Node.js bindings for the provider-management core of
+Native Node.js bindings for the provider, MCP, and Skills management core of
 [CC Switch CLI](https://github.com/SaladDay/cc-switch-cli), built with
 [napi-rs](https://napi.rs/).
 
@@ -71,6 +71,15 @@ ccSwitch.extractCommonConfigFromSettings('claude', settings)
 ccSwitch.setCommonConfig('claude', snippet)
 ccSwitch.clearCommonConfig('claude')
 ccSwitch.syncCurrentToLive()
+
+ccSwitch.upsertMcpServer(mcpServer)
+ccSwitch.toggleMcpApp('filesystem', 'claude', true)
+ccSwitch.syncMcpToLive()
+
+ccSwitch.listSkills()
+await ccSwitch.installSkill('owner/repo:skill-directory', 'codex')
+ccSwitch.toggleSkillApp('skill-directory', 'claude', true)
+ccSwitch.syncSkillsToLive()
 ccSwitch.close()
 ```
 
@@ -128,10 +137,11 @@ explicit force-sync operation. Use an isolated HOME/config environment in
 tests. The constructor opens CC Switch storage but does not import live
 configuration implicitly.
 
-All bindings are synchronous because they preserve the upstream service API.
-Calls can perform SQLite and filesystem I/O (and a switch may coordinate a
-running proxy), so invoke them from a Node worker thread when event-loop
-latency matters.
+Provider, MCP, and local Skills management calls are synchronous because they
+preserve the upstream service API. `installSkill()` is asynchronous because it
+may download a repository. Synchronous calls can perform SQLite and filesystem
+I/O (and a switch may coordinate a running proxy), so invoke them from a Node
+worker thread when event-loop latency matters.
 
 Browser and WASI builds are not supported by this native, filesystem-backed
 binding.
@@ -174,11 +184,12 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 The test suite uses isolated configuration directories and exercises provider
-CRUD, live switching, duplication, common-config sanitization, lifecycle
-release, invalid app handling, and single-instance protection. Release CI also
-builds and runs native tests on every supported host architecture where the
-runner can execute the target, then installs the published package from npm on
-Linux, macOS, and Windows and opens an isolated store.
+CRUD/live switching, MCP registry/projection, local Skill import/projection,
+common-config sanitization, lifecycle release, invalid app handling, and
+single-instance protection. Release CI also builds and runs native tests on
+every supported host architecture where the runner can execute the target,
+then installs the published package from npm on Linux, macOS, and Windows and
+opens an isolated store.
 
 The upstream Rust crate is vendored at `vendor/cc-switch-cli` and pinned in
 `vendor/cc-switch-cli/UPSTREAM.md`.

@@ -105,8 +105,128 @@ clears it.
 
 Explicitly clears the common-config snippet.
 
+## MCP servers
+
+MCP uses one unified registry with an application matrix. Claude, Codex,
+Gemini, OpenCode, and Hermes are supported; OpenClaw is not an MCP projection
+target in the pinned upstream revision.
+
+### `supportedMcpApps(): McpAppId[]`
+
+Returns the supported MCP projection targets.
+
+### `listMcpServers(): Record<string, McpServer>`
+
+Returns the unified MCP registry keyed by server ID.
+
+### `upsertMcpServer(server): void`
+
+Validates and adds or replaces a server, then projects it to every application
+enabled in `server.apps`.
+
+### `deleteMcpServer(serverId): boolean`
+
+Deletes a server and removes it from all live configs where it was enabled.
+
+### `toggleMcpApp(serverId, app, enabled): void`
+
+Changes one application flag and immediately adds/removes the live projection.
+
+### `setMcpApps(serverId, apps): boolean`
+
+Atomically replaces all application flags. Returns `false` if the server does
+not exist.
+
+### `syncMcpToLive(app?): void`
+
+Reprojects the registry to one application, or all supported applications when
+`app` is omitted.
+
+### `importMcpFromLive(app?): number`
+
+Imports live MCP definitions from one application, or every supported
+application when omitted, into the unified registry.
+
+## Skills
+
+Skills use `~/.cc-switch/skills` (or the isolated CC Switch config directory)
+as their single source of truth and project into Claude, Codex, Gemini,
+OpenCode, and Hermes. OpenClaw remains unsupported upstream.
+
+### `supportedSkillApps(): SkillAppId[]`
+
+Returns supported Skill projection targets.
+
+### `listSkills(): InstalledSkill[]`
+
+Lists managed Skills and their application matrices.
+
+### `installSkill(spec, app): Promise<InstalledSkill>`
+
+Resolves an upstream-supported repository/directory spec, downloads it into
+the Skills SSOT, and enables it for one application. This is the only
+asynchronous method in the current SDK.
+
+### `uninstallSkill(directoryOrId): void`
+
+Removes a managed Skill from every application and the SSOT.
+
+### `toggleSkillApp(directoryOrId, app, enabled): void`
+
+Enables or disables one application projection.
+
+### `setSkillApps(directoryOrId, apps): boolean`
+
+Replaces the complete application matrix. Returns `false` only when the
+upstream service reports no update.
+
+### `syncSkillsToLive(app?): void`
+
+Projects enabled Skills to one application, or all supported applications.
+
+### `scanUnmanagedSkills(): UnmanagedSkill[]`
+
+Finds valid `SKILL.md` directories in application/agent locations that are not
+yet managed.
+
+### `importSkills(selections): InstalledSkill[]`
+
+Imports unmanaged directories with explicit application matrices into the
+SSOT.
+
+### `listSkillRepos()`, `upsertSkillRepo(repo)`, `removeSkillRepo(owner, name)`
+
+Manage repository sources used by Skill discovery and installation.
+
+### `skillSyncMethod(): SkillSyncMethod`
+
+Returns `auto`, `symlink`, or `copy`.
+
+### `setSkillSyncMethod(method): void`
+
+Changes the deployment strategy used for subsequent Skill projection.
+
+### `discoverSkills(forceRefresh?): Promise<DiscoverableSkill[]>`
+
+Discovers installable Skills from enabled repositories, using the upstream
+cache unless `forceRefresh` is true.
+
+### `searchSkills(query, limit?, offset?): Promise<SkillSearchResult>`
+
+Searches the skills.sh catalog. The upstream client clamps `limit` to 1–100.
+
+### `checkSkillUpdates(): Promise<SkillUpdateCheckResult>`
+
+Compares installed repository-backed Skills with their remote content and
+returns both available updates and per-repository failures.
+
+### `updateSkills(ids): Promise<SkillUpdateBatchResult>`
+
+Updates selected Skill IDs and reports successful installed records alongside
+per-Skill failures.
+
 ## Execution model
 
-All methods are synchronous because the pinned provider service is synchronous.
-They may perform filesystem and SQLite I/O; use a Node worker thread if latency
-on the main event loop matters.
+All methods except `installSkill()` are synchronous. They may perform
+filesystem and SQLite I/O; use a Node worker thread if latency on the main
+event loop matters.
