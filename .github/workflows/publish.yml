@@ -133,3 +133,34 @@ jobs:
         run: npm publish --access public --provenance
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  smoke-install:
+    name: Smoke install on ${{ matrix.os }}
+    needs: publish
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Install the published package and open an isolated store
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          work="$RUNNER_TEMP/cc-switch-published-smoke"
+          mkdir -p "$work"
+          cd "$work"
+          npm init -y
+          for attempt in 1 2 3 4 5 6; do
+            npm install "@botiverse/cc-switch@$version" && break
+            if [ "$attempt" = 6 ]; then exit 1; fi
+            sleep 10
+          done
+          node "$GITHUB_WORKSPACE/scripts/smoke-installed.cjs"

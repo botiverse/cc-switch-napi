@@ -45,12 +45,25 @@ export declare class CcSwitch {
   deleteProvider(app: import('./api.js').AppId, providerId: string): void
   /** Imports providers from the application's current live configuration. */
   importLiveConfig(app: import('./api.js').AppId): number
+  /**
+   * Imports the current live config as the initial `default` provider.
+   * Additive-mode apps return `false`; existing non-official providers are not overwritten.
+   */
+  importDefaultConfig(app: import('./api.js').AppId): boolean
   /** Removes a provider from an additive live config without deleting it. */
   removeFromLiveConfig(app: import('./api.js').AppId, providerId: string): void
   /** Sets the default provider/model for Hermes or OpenClaw. */
   setDefaultProvider(app: import('./api.js').AppId, providerId: string, modelId?: string | undefined | null): string
   /** Reads the application's live provider settings without changing them. */
   readLiveSettings(app: import('./api.js').AppId): import('./api.js').JsonValue
+  /** Extracts a non-sensitive common-config snippet from the current provider. */
+  extractCommonConfig(app: import('./api.js').AppId): string
+  /** Extracts a non-sensitive common-config snippet from an arbitrary settings object. */
+  extractCommonConfigFromSettings(app: import('./api.js').AppId, settings: import('./api.js').JsonValue): string
+  /** Stores or clears the app-level common-config snippet used during provider writes. */
+  setCommonConfig(app: import('./api.js').AppId, snippet?: string | undefined | null): void
+  /** Clears the app-level common-config snippet. */
+  clearCommonConfig(app: import('./api.js').AppId): void
   /** Writes all currently selected providers back to their live configs. */
   syncCurrentToLive(): void
 }

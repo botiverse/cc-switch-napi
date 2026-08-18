@@ -4,9 +4,38 @@ Native Node.js bindings for the provider-management core of
 [CC Switch CLI](https://github.com/SaladDay/cc-switch-cli), built with
 [napi-rs](https://napi.rs/).
 
-The source repository is private while the API is being stabilized. Release
-automation is configured to publish the package from GitHub Releases; no npm
-package is published merely by pushing a commit.
+The project is public and published on npm. It vendors the CC Switch core at a
+pinned upstream revision so JavaScript applications can use provider switching
+without shelling out to the CLI.
+
+## Install
+
+```bash
+npm install @botiverse/cc-switch
+```
+
+Node.js 18 or newer is required. Prebuilt packages cover macOS arm64/x64,
+Windows x64, Linux arm64/x64 glibc, and Linux x64 musl.
+
+## Quick start
+
+```ts
+import { CcSwitch } from '@botiverse/cc-switch'
+
+const ccSwitch = new CcSwitch()
+
+try {
+  console.log(ccSwitch.supportedApps())
+  console.log(ccSwitch.listProviders('claude'))
+
+  ccSwitch.switchProvider('claude', 'provider-id')
+} finally {
+  ccSwitch.close()
+}
+```
+
+See [API reference](docs/API.md) for every method and
+[binding coverage](docs/COVERAGE.md) for the exact upstream boundary.
 
 ## Supported applications
 
@@ -33,9 +62,14 @@ ccSwitch.duplicateProvider('claude', 'provider-id')
 ccSwitch.switchProvider('claude', 'provider-id')
 ccSwitch.deleteProvider('claude', 'provider-id')
 ccSwitch.importLiveConfig('opencode')
+ccSwitch.importDefaultConfig('claude')
 ccSwitch.removeFromLiveConfig('opencode', 'provider-id')
 ccSwitch.setDefaultProvider('openclaw', 'provider-id', 'model-id')
 ccSwitch.readLiveSettings('codex')
+ccSwitch.extractCommonConfig('claude')
+ccSwitch.extractCommonConfigFromSettings('claude', settings)
+ccSwitch.setCommonConfig('claude', snippet)
+ccSwitch.clearCommonConfig('claude')
 ccSwitch.syncCurrentToLive()
 ccSwitch.close()
 ```
@@ -105,6 +139,17 @@ binding.
 Release artifacts cover macOS arm64/x64, Windows x64, and Linux arm64/x64
 glibc plus Linux x64 musl.
 
+## Documentation
+
+- [API reference](docs/API.md)
+- [Binding coverage and non-goals](docs/COVERAGE.md)
+- [Vendored upstream revision](vendor/cc-switch-cli/UPSTREAM.md)
+
+The API is small enough that versioned Markdown beside the source is the
+canonical documentation. A separate documentation site would add deployment
+and versioning machinery without improving discoverability yet; GitHub renders
+these files directly and npm links back to this repository.
+
 ## Publishing
 
 The release workflow follows the napi-rs package-template flow: each supported
@@ -112,10 +157,11 @@ target is built independently, the native artifacts are assembled into scoped
 platform packages, `napi prepublish` publishes those packages, and npm then
 publishes `@botiverse/cc-switch` with matching optional dependencies.
 
-Publishing only runs for a published GitHub Release whose tag is exactly
-`v<package.json version>`. The repository must provide an npm automation token
-as the `NPM_TOKEN` Actions secret; npm provenance is enabled for the workflow.
-Normal pushes and pull requests build and test artifacts but never publish.
+Publishing only runs from `.github/workflows/publish.yml` for a published
+GitHub Release whose tag is exactly `v<package.json version>`. npm Trusted
+Publisher supplies short-lived OIDC credentials; no long-lived npm token is
+stored in GitHub. Provenance is required. Normal pushes and pull requests run
+`.github/workflows/CI.yml` and never publish.
 
 ## Development
 
@@ -126,6 +172,13 @@ corepack yarn test
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```
+
+The test suite uses isolated configuration directories and exercises provider
+CRUD, live switching, duplication, common-config sanitization, lifecycle
+release, invalid app handling, and single-instance protection. Release CI also
+builds and runs native tests on every supported host architecture where the
+runner can execute the target, then installs the published package from npm on
+Linux, macOS, and Windows and opens an isolated store.
 
 The upstream Rust crate is vendored at `vendor/cc-switch-cli` and pinned in
 `vendor/cc-switch-cli/UPSTREAM.md`.

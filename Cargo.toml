@@ -3,9 +3,9 @@ authors      = ["Jiacheng"]
 edition      = "2021"
 license      = "MIT"
 name         = "cc-switch-napi"
-repository   = "https://github.com/bytemain/cc-switch-napi"
+repository   = "https://github.com/botiverse/cc-switch-napi"
 rust-version = "1.91.1"
-version      = "0.1.0"
+version      = "0.1.1"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

@@ -193,6 +193,16 @@ impl CcSwitch {
       .map_err(napi_error)
   }
 
+  /// Imports the current live config as the initial `default` provider.
+  /// Additive-mode apps return `false`; existing non-official providers are not overwritten.
+  #[napi]
+  pub fn import_default_config(
+    &self,
+    #[napi(ts_arg_type = "import('./api.js').AppId")] app: String,
+  ) -> Result<bool> {
+    ProviderService::import_default_config(self.state()?, parse_app(&app)?).map_err(napi_error)
+  }
+
   /// Removes a provider from an additive live config without deleting it.
   #[napi]
   pub fn remove_from_live_config(
@@ -228,6 +238,48 @@ impl CcSwitch {
     #[napi(ts_arg_type = "import('./api.js').AppId")] app: String,
   ) -> Result<Value> {
     ProviderService::read_live_settings(parse_app(&app)?).map_err(napi_error)
+  }
+
+  /// Extracts a non-sensitive common-config snippet from the current provider.
+  #[napi]
+  pub fn extract_common_config(
+    &self,
+    #[napi(ts_arg_type = "import('./api.js').AppId")] app: String,
+  ) -> Result<String> {
+    ProviderService::extract_common_config_snippet(self.state()?, parse_app(&app)?)
+      .map_err(napi_error)
+  }
+
+  /// Extracts a non-sensitive common-config snippet from an arbitrary settings object.
+  #[napi]
+  pub fn extract_common_config_from_settings(
+    &self,
+    #[napi(ts_arg_type = "import('./api.js').AppId")] app: String,
+    #[napi(ts_arg_type = "import('./api.js').JsonValue")] settings: Value,
+  ) -> Result<String> {
+    ProviderService::extract_common_config_snippet_from_settings(parse_app(&app)?, &settings)
+      .map_err(napi_error)
+  }
+
+  /// Stores or clears the app-level common-config snippet used during provider writes.
+  #[napi]
+  pub fn set_common_config(
+    &self,
+    #[napi(ts_arg_type = "import('./api.js').AppId")] app: String,
+    snippet: Option<String>,
+  ) -> Result<()> {
+    ProviderService::set_common_config_snippet(self.state()?, parse_app(&app)?, snippet)
+      .map_err(napi_error)
+  }
+
+  /// Clears the app-level common-config snippet.
+  #[napi]
+  pub fn clear_common_config(
+    &self,
+    #[napi(ts_arg_type = "import('./api.js').AppId")] app: String,
+  ) -> Result<()> {
+    ProviderService::clear_common_config_snippet(self.state()?, parse_app(&app)?)
+      .map_err(napi_error)
   }
 
   /// Writes all currently selected providers back to their live configs.

@@ -27,7 +27,11 @@ test.after.always(() => {
 })
 
 test.serial('reports every upstream provider application', (t) => {
-  t.deepEqual(client.supportedApps(), ['claude', 'codex', 'gemini', 'opencode', 'hermes', 'openclaw'])
+  const apps = client.supportedApps()
+  t.deepEqual(apps, ['claude', 'codex', 'gemini', 'opencode', 'hermes', 'openclaw'])
+  for (const app of apps) {
+    t.true(Array.isArray(client.listProviders(app)))
+  }
   t.is(client.currentProvider('openclaw'), null)
 })
 
@@ -95,6 +99,26 @@ test.serial('adds and switches a Claude provider in the isolated live config', (
   })
   client.deleteProvider('claude', provider.id)
   t.false(client.listProviders('claude').some((entry) => entry.id === provider.id))
+})
+
+test.serial('exposes default import and non-sensitive common-config operations', (t) => {
+  const snippet = client.extractCommonConfigFromSettings('claude', {
+    env: {
+      ANTHROPIC_BASE_URL: 'https://example.invalid',
+      ANTHROPIC_AUTH_TOKEN: 'secret',
+      KEEP_ME: 'safe',
+    },
+    theme: 'dark',
+  })
+
+  t.deepEqual(JSON.parse(snippet), {
+    env: { KEEP_ME: 'safe' },
+    theme: 'dark',
+  })
+
+  client.setCommonConfig('claude', snippet)
+  client.clearCommonConfig('claude')
+  t.false(client.importDefaultConfig('opencode'))
 })
 
 test.serial('releases the store and instance slot explicitly', (t) => {
