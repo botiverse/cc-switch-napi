@@ -128,3 +128,4 @@ dist
 !.yarn/sdks
 !.yarn/versions
 /npm
+/artifacts

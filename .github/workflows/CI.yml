@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  release:
+    types: [published]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -54,12 +56,36 @@ jobs:
       - name: Check Rust lints
         run: cargo clippy --all-targets -- -D warnings
 
-  test:
-    name: Test (${{ matrix.os }})
+  build:
+    name: Build ${{ matrix.target }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14, windows-latest]
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            build: yarn build --target aarch64-apple-darwin
+            native: true
+          - os: macos-14
+            target: x86_64-apple-darwin
+            build: yarn build --target x86_64-apple-darwin
+            native: false
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            build: yarn build --target x86_64-pc-windows-msvc
+            native: true
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            build: yarn build --target x86_64-unknown-linux-gnu --use-napi-cross
+            native: true
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            build: yarn build --target x86_64-unknown-linux-musl -x
+            native: false
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            build: yarn build --target aarch64-unknown-linux-gnu --use-napi-cross
+            native: false
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -76,19 +102,79 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.91.1
+          targets: ${{ matrix.target }}
+
+      - name: Install Zig
+        if: contains(matrix.target, 'musl')
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+
+      - name: Install cargo-zigbuild
+        if: contains(matrix.target, 'musl')
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
 
       - name: Install dependencies
         run: yarn install --immutable
 
       - name: Build native binding
-        run: yarn build:debug
+        shell: bash
+        run: ${{ matrix.build }}
 
       - name: Test native binding
+        if: matrix.native
         run: yarn test
 
       - name: Upload native binding
         uses: actions/upload-artifact@v4
         with:
-          name: cc-switch-napi-${{ matrix.os }}
+          name: bindings-${{ matrix.target }}
           path: cc-switch-napi.*.node
           if-no-files-found: error
+
+  publish:
+    name: Publish @botiverse/cc-switch
+    if: github.event_name == 'release'
+    needs: [lint, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: yarn
+          registry-url: https://registry.npmjs.org
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Verify release tag matches package version
+        run: node -e "const p=require('./package.json'); if (process.env.GITHUB_REF_NAME !== 'v' + p.version) throw new Error('Release tag must equal v' + p.version)"
+
+      - name: Create platform packages
+        run: yarn napi create-npm-dirs
+
+      - name: Download native bindings
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Assemble npm packages
+        run: yarn artifacts
+
+      - name: Enable npm provenance
+        run: npm config set provenance true
+
+      - name: Publish package
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

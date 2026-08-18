@@ -1,18 +1,12 @@
-# cc-switch-napi
+# @botiverse/cc-switch
 
 Native Node.js bindings for the provider-management core of
 [CC Switch CLI](https://github.com/SaladDay/cc-switch-cli), built with
 [napi-rs](https://napi.rs/).
 
-The repository is private while the API is being stabilized, but the code,
-documentation, attribution, and tests are maintained as an open-source
-project.
-
-The package is marked `private` as an additional guard against accidental npm
-publication during this stabilization phase.
-
-No npm package is published yet. Clone the repository and run the development
-build below; CI also retains native build artifacts for each tested host.
+The source repository is private while the API is being stabilized. Release
+automation is configured to publish the package from GitHub Releases; no npm
+package is published merely by pushing a commit.
 
 ## Supported applications
 
@@ -26,7 +20,7 @@ build below; CI also retains native build artifacts for each tested host.
 ## API
 
 ```ts
-import { CcSwitch } from 'cc-switch-napi'
+import { CcSwitch } from '@botiverse/cc-switch'
 
 const ccSwitch = new CcSwitch()
 
@@ -103,6 +97,21 @@ latency matters.
 
 Browser and WASI builds are not supported by this native, filesystem-backed
 binding.
+
+Release artifacts cover macOS arm64/x64, Windows x64, and Linux arm64/x64
+glibc plus Linux x64 musl.
+
+## Publishing
+
+The release workflow follows the napi-rs package-template flow: each supported
+target is built independently, the native artifacts are assembled into scoped
+platform packages, `napi prepublish` publishes those packages, and npm then
+publishes `@botiverse/cc-switch` with matching optional dependencies.
+
+Publishing only runs for a published GitHub Release whose tag is exactly
+`v<package.json version>`. The repository must provide an npm automation token
+as the `NPM_TOKEN` Actions secret; npm provenance is enabled for the workflow.
+Normal pushes and pull requests build and test artifacts but never publish.
 
 ## Development
 

@@ -1,7 +1,6 @@
 {
-  "name": "cc-switch-napi",
+  "name": "@botiverse/cc-switch",
   "version": "0.1.0",
-  "private": true,
   "description": "Native Node.js bindings for CC Switch provider management",
   "main": "index.js",
   "types": "api.d.ts",
@@ -10,6 +9,10 @@
     "url": "git+https://github.com/bytemain/cc-switch-napi.git"
   },
   "license": "MIT",
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "keywords": [
     "napi-rs",
     "NAPI",
@@ -34,9 +37,7 @@
       "x86_64-unknown-linux-gnu",
       "x86_64-unknown-linux-musl",
       "aarch64-unknown-linux-gnu",
-      "aarch64-apple-darwin",
-      "aarch64-unknown-linux-musl",
-      "aarch64-pc-windows-msvc"
+      "aarch64-apple-darwin"
     ]
   },
   "engines": {
@@ -51,6 +52,7 @@
     "format:toml": "taplo format",
     "format:rs": "cargo fmt",
     "lint": "oxlint .",
+    "prepublishOnly": "napi prepublish -t npm",
     "test": "ava",
     "preversion": "napi build --platform && git add .",
     "version": "napi version",

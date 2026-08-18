@@ -5,6 +5,28 @@ __metadata:
   version: 10
   cacheKey: 10c0
 
+"@botiverse/cc-switch@workspace:.":
+  version: 0.0.0-use.local
+  resolution: "@botiverse/cc-switch@workspace:."
+  dependencies:
+    "@emnapi/core": "npm:^1.5.0"
+    "@emnapi/runtime": "npm:^1.5.0"
+    "@napi-rs/cli": "npm:^3.2.0"
+    "@oxc-node/core": "npm:^0.1.0"
+    "@taplo/cli": "npm:^0.7.0"
+    "@tybys/wasm-util": "npm:^0.10.0"
+    "@types/node": "npm:^22.0.0"
+    ava: "npm:^8.0.0"
+    chalk: "npm:^5.6.2"
+    husky: "npm:^9.1.7"
+    lint-staged: "npm:^17.0.0"
+    npm-run-all2: "npm:^9.0.0"
+    oxlint: "npm:^1.14.0"
+    prettier: "npm:^3.6.2"
+    typescript: "npm:^7.0.0"
+  languageName: unknown
+  linkType: soft
+
 "@emnapi/core@npm:1.9.1":
   version: 1.9.1
   resolution: "@emnapi/core@npm:1.9.1"
@@ -1797,28 +1819,6 @@ __metadata:
   checksum: 10c0/4c197d783415cade31565725a5e6b2b967d856285eacdb0b5f5ec0687d93c12f2ee9c6cc05aa7be02e8bbf0fe3ba40d22be69b56bd2ab1be2cc0a59370f14246
   languageName: node
   linkType: hard
-
-"cc-switch-napi@workspace:.":
-  version: 0.0.0-use.local
-  resolution: "cc-switch-napi@workspace:."
-  dependencies:
-    "@emnapi/core": "npm:^1.5.0"
-    "@emnapi/runtime": "npm:^1.5.0"
-    "@napi-rs/cli": "npm:^3.2.0"
-    "@oxc-node/core": "npm:^0.1.0"
-    "@taplo/cli": "npm:^0.7.0"
-    "@tybys/wasm-util": "npm:^0.10.0"
-    "@types/node": "npm:^22.0.0"
-    ava: "npm:^8.0.0"
-    chalk: "npm:^5.6.2"
-    husky: "npm:^9.1.7"
-    lint-staged: "npm:^17.0.0"
-    npm-run-all2: "npm:^9.0.0"
-    oxlint: "npm:^1.14.0"
-    prettier: "npm:^3.6.2"
-    typescript: "npm:^7.0.0"
-  languageName: unknown
-  linkType: soft
 
 "chalk@npm:^5.6.2":
   version: 5.6.2
