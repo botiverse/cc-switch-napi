@@ -1,0 +1,655 @@
+use super::*;
+
+pub(super) const HEADER_STATUS_VALUE_MAX_WIDTH: u16 = 512;
+const HEADER_BLANK_CHECK_MAX_BYTES: usize = 4 * 1024;
+const HEADER_BLANK_CHECK_MAX_CHARS: usize = 2 * 1024;
+
+fn bounded_header_value_is_blank(value: &str) -> bool {
+    for (count, (byte, ch)) in value.char_indices().enumerate() {
+        if count >= HEADER_BLANK_CHECK_MAX_CHARS || byte >= HEADER_BLANK_CHECK_MAX_BYTES {
+            // A value larger than the header's inspection budget is kept as a
+            // non-empty, truncated value. Determining that it is entirely
+            // whitespace must never require a full per-frame scan.
+            return false;
+        }
+        if !ch.is_whitespace() {
+            return false;
+        }
+    }
+    true
+}
+
+fn openclaw_header_default_model_value(data: &UiData) -> &str {
+    if app::openclaw_agents_has_blocking_warning(data) {
+        return texts::tui_header_config_error();
+    }
+
+    let primary = data
+        .config
+        .openclaw_agents_defaults
+        .as_ref()
+        .and_then(|defaults| defaults.model.as_ref())
+        .map(|model| model.primary.as_str());
+    match primary {
+        Some(value) if !bounded_header_value_is_blank(value) => value,
+        _ => texts::none(),
+    }
+}
+
+fn header_provider_display_name<'a>(app_type: &AppType, row: &'a ProviderRow) -> &'a str {
+    if !bounded_header_value_is_blank(&row.provider.name) {
+        return &row.provider.name;
+    }
+
+    if matches!(app_type, AppType::OpenClaw) {
+        &row.id
+    } else {
+        &row.provider.name
+    }
+}
+
+fn opencode_configured_provider_count(data: &UiData) -> usize {
+    // Provider rows are intentionally treated as a low-cardinality,
+    // user-managed configuration collection. Reading the snapshot directly
+    // keeps this badge consistent with the list; a second cached summary would
+    // add invalidation paths for little practical gain. High-cardinality data
+    // such as sessions, usage logs, rules, and model catalogs is virtualized at
+    // its own boundary instead.
+    data.providers
+        .rows
+        .iter()
+        .filter(|row| row.is_in_config)
+        .count()
+}
+
+fn header_status_label(app_type: &AppType) -> &'static str {
+    match app_type {
+        AppType::OpenCode => texts::tui_opencode_config_status_label(),
+        AppType::OpenClaw => texts::tui_openclaw_agents_primary_model(),
+        _ => strip_trailing_colon(texts::provider_label()),
+    }
+}
+
+pub(super) fn header_status_value(app: &App, data: &UiData, available_width: u16) -> String {
+    if matches!(app.app_type, AppType::OpenCode) {
+        return texts::tui_provider_config_count(
+            opencode_configured_provider_count(data),
+            data.providers.rows.len(),
+        );
+    }
+
+    if matches!(app.app_type, AppType::OpenClaw) {
+        return truncate_to_display_width(
+            openclaw_header_default_model_value(data),
+            available_width.min(HEADER_STATUS_VALUE_MAX_WIDTH),
+        );
+    }
+
+    let provider_name = match data.providers.rows.iter().find(|row| row.is_current) {
+        Some(row) => header_provider_display_name(&app.app_type, row),
+        None => texts::none(),
+    };
+    truncate_to_display_width(
+        provider_name,
+        available_width.min(HEADER_STATUS_VALUE_MAX_WIDTH),
+    )
+}
+
+fn fit_header_status_badge(
+    status_text_full: &str,
+    available_after_title: u16,
+    proxy_badge_width: Option<u16>,
+) -> Option<String> {
+    let full_status_badge = format!("  {status_text_full}  ");
+    let full_status_badge_width = UnicodeWidthStr::width(full_status_badge.as_str()) as u16;
+    let reserved_proxy_width = proxy_badge_width.map(|width| width + 1).unwrap_or(0);
+
+    if reserved_proxy_width + full_status_badge_width <= available_after_title {
+        return Some(full_status_badge);
+    }
+
+    let status_budget = available_after_title.saturating_sub(reserved_proxy_width);
+    if status_budget < 5 {
+        return None;
+    }
+
+    let truncated = truncate_to_display_width(status_text_full, status_budget.saturating_sub(4));
+    Some(format!("  {truncated}  "))
+}
+
+pub(super) fn render_header(
+    frame: &mut Frame<'_>,
+    app: &App,
+    data: &UiData,
+    area: Rect,
+    theme: &super::theme::Theme,
+) {
+    let title_text = format!("  {}", texts::tui_app_title());
+    let title_width = UnicodeWidthStr::width(title_text.as_str()) as u16;
+
+    let title = Paragraph::new(Line::from(vec![Span::styled(
+        title_text,
+        if theme.no_color {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(theme.fg_strong)
+                .add_modifier(Modifier::BOLD)
+        },
+    )]))
+    .alignment(Alignment::Left);
+
+    let visible_apps = crate::settings::get_visible_apps();
+    let tabs_line = Line::from(
+        super::config::ordered_visible_app_types(&visible_apps)
+            .into_iter()
+            .enumerate()
+            .flat_map(|(idx, app_type)| {
+                let style = if app_type == app.app_type {
+                    active_chip_style(theme)
+                } else {
+                    inactive_chip_style(theme)
+                };
+                let mut spans = Vec::with_capacity(2);
+                if idx > 0 {
+                    spans.push(Span::raw(" "));
+                }
+                spans.push(Span::styled(format!(" {} ", app_type.as_str()), style));
+                spans
+            })
+            .collect::<Vec<_>>(),
+    );
+
+    let proxy_badge = data
+        .proxy
+        .routes_current_app_through_proxy(&app.app_type)
+        .map(|enabled| {
+            let text = texts::tui_header_proxy_status_with_failover(
+                enabled,
+                data.proxy.auto_failover_enabled,
+            );
+            let style = if enabled {
+                selection_style(theme)
+            } else if theme.no_color {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.fg_strong).bg(theme.surface)
+            };
+            (format!("  {text}  "), style)
+        });
+
+    let available_after_title = area.width.saturating_sub(title_width);
+    let status_text_full = format!(
+        "{}: {}",
+        header_status_label(&app.app_type),
+        header_status_value(app, data, available_after_title)
+    );
+    let proxy_badge_width = proxy_badge
+        .as_ref()
+        .map(|(text, _)| UnicodeWidthStr::width(text.as_str()) as u16);
+    let status_badge =
+        fit_header_status_badge(&status_text_full, available_after_title, proxy_badge_width);
+    let status_badge_width = status_badge
+        .as_ref()
+        .map(|text| UnicodeWidthStr::width(text.as_str()) as u16);
+    let right_width = match (proxy_badge_width, status_badge_width) {
+        (Some(proxy_width), Some(status_width)) => proxy_width + 1 + status_width,
+        (Some(proxy_width), None) => proxy_width,
+        (None, Some(status_width)) => status_width,
+        (None, None) => 0,
+    };
+
+    let title_area = Rect::new(area.x, area.y, title_width.min(area.width), area.height);
+    let right_x = area
+        .right()
+        .saturating_sub(right_width)
+        .max(title_area.right());
+    let right_area = Rect::new(
+        right_x,
+        area.y,
+        area.right().saturating_sub(right_x),
+        area.height,
+    );
+    let tabs_x = title_area.right();
+    let tabs_right = right_area.x;
+    let tabs_area = Rect::new(
+        tabs_x,
+        area.y,
+        tabs_right.saturating_sub(tabs_x),
+        area.height,
+    );
+
+    frame.render_widget(
+        Paragraph::new(tabs_line).alignment(Alignment::Center),
+        tabs_area,
+    );
+    frame.render_widget(title, title_area);
+
+    let right_spans = match (proxy_badge, status_badge) {
+        (Some((proxy_text, proxy_style)), Some(status_text)) => vec![
+            Span::styled(proxy_text, proxy_style),
+            Span::raw(" "),
+            Span::styled(status_text, selection_style(theme)),
+        ],
+        (None, Some(status_text)) => vec![Span::styled(status_text, selection_style(theme))],
+        (Some((proxy_text, proxy_style)), None) => vec![Span::styled(proxy_text, proxy_style)],
+        (None, None) => Vec::new(),
+    };
+
+    frame.render_widget(
+        Paragraph::new(Line::from(right_spans)).alignment(Alignment::Right),
+        right_area,
+    );
+}
+
+pub(super) fn split_nav_label(label: &str) -> (&str, &str) {
+    if let Some((icon, rest)) = label.split_once(' ') {
+        (icon, rest)
+    } else {
+        ("", label)
+    }
+}
+
+pub(super) fn nav_label(item: NavItem) -> &'static str {
+    match item {
+        NavItem::Main => texts::menu_home(),
+        NavItem::Providers => texts::menu_manage_providers(),
+        NavItem::Usage => texts::menu_usage(),
+        NavItem::Sessions => texts::menu_manage_sessions(),
+        NavItem::Mcp => texts::menu_manage_mcp(),
+        NavItem::Prompts => texts::menu_manage_prompts(),
+        NavItem::HermesMemory => texts::menu_hermes_memory(),
+        NavItem::Config => texts::menu_manage_config(),
+        NavItem::Skills => texts::menu_manage_skills(),
+        NavItem::OpenClawWorkspace => texts::menu_openclaw_workspace(),
+        NavItem::OpenClawEnv => texts::menu_openclaw_env(),
+        NavItem::OpenClawTools => texts::menu_openclaw_tools(),
+        NavItem::OpenClawAgents => texts::menu_openclaw_agents(),
+        NavItem::Settings => texts::menu_settings(),
+        NavItem::Exit => texts::menu_exit(),
+    }
+}
+
+pub(super) fn nav_label_variants(item: NavItem) -> (&'static str, &'static str) {
+    match item {
+        NavItem::Main => texts::menu_home_variants(),
+        NavItem::Providers => texts::menu_manage_providers_variants(),
+        NavItem::Usage => texts::menu_usage_variants(),
+        NavItem::Sessions => texts::menu_manage_sessions_variants(),
+        NavItem::Mcp => texts::menu_manage_mcp_variants(),
+        NavItem::Prompts => texts::menu_manage_prompts_variants(),
+        NavItem::HermesMemory => texts::menu_hermes_memory_variants(),
+        NavItem::Config => texts::menu_manage_config_variants(),
+        NavItem::Skills => texts::menu_manage_skills_variants(),
+        NavItem::OpenClawWorkspace => texts::menu_openclaw_workspace_variants(),
+        NavItem::OpenClawEnv => texts::menu_openclaw_env_variants(),
+        NavItem::OpenClawTools => texts::menu_openclaw_tools_variants(),
+        NavItem::OpenClawAgents => texts::menu_openclaw_agents_variants(),
+        NavItem::Settings => texts::menu_settings_variants(),
+        NavItem::Exit => texts::menu_exit_variants(),
+    }
+}
+
+pub(super) fn nav_pane_width(theme: &super::theme::Theme) -> u16 {
+    const NAV_BORDER_WIDTH: u16 = 2;
+    const NAV_ICON_COL_WIDTH: u16 = 3;
+    const NAV_COL_SPACING: u16 = 1;
+    const NAV_TEXT_MIN_WIDTH: u16 = 10;
+    const NAV_TEXT_EXTRA_WIDTH: u16 = 2;
+    let highlight_width = UnicodeWidthStr::width(highlight_symbol(theme)) as u16;
+
+    let max_text_width = NavItem::ALL
+        .iter()
+        .chain(NavItem::OPENCLAW_ALL.iter())
+        .chain(NavItem::HERMES_ALL.iter())
+        .flat_map(|item| {
+            let (en, zh) = nav_label_variants(*item);
+            [en, zh]
+        })
+        .map(|label| {
+            let (_icon, text) = split_nav_label(label);
+            UnicodeWidthStr::width(text) as u16
+        })
+        .max()
+        .unwrap_or(NAV_TEXT_MIN_WIDTH);
+
+    let text_col_width = max_text_width
+        .saturating_add(NAV_TEXT_EXTRA_WIDTH)
+        .max(NAV_TEXT_MIN_WIDTH);
+
+    // In ASCII mode the emoji column is collapsed, so it reserves no width.
+    let icon_col_width = if icons::use_emoji() {
+        NAV_ICON_COL_WIDTH
+    } else {
+        0
+    };
+
+    NAV_BORDER_WIDTH
+        .saturating_add(highlight_width)
+        .saturating_add(icon_col_width)
+        .saturating_add(NAV_COL_SPACING)
+        .saturating_add(text_col_width)
+}
+pub(super) fn render_nav(
+    frame: &mut Frame<'_>,
+    app: &App,
+    area: Rect,
+    theme: &super::theme::Theme,
+) {
+    let emoji = icons::use_emoji();
+    let rows = app.nav_items().iter().map(|item| {
+        let (icon, text) = split_nav_label(nav_label(*item));
+        // ASCII mode drops the emoji entirely (an empty, zero-width column)
+        // so wide-rendered glyphs can never push the text past the border.
+        let icon_cell = if emoji {
+            cell_pad(icon).replace('\u{FE0F}', "")
+        } else {
+            String::new()
+        };
+        Row::new(vec![Cell::from(icon_cell), Cell::from(text)])
+    });
+
+    let icon_col_width = if emoji { 3 } else { 0 };
+    let table = Table::new(
+        rows,
+        [Constraint::Length(icon_col_width), Constraint::Min(10)],
+    )
+    .column_spacing(1)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Plain)
+            .border_style(pane_border_style(app, Focus::Nav, theme))
+            .title(format!(" {} ", texts::tui_nav_title())),
+    )
+    .row_highlight_style(selection_style(theme))
+    .highlight_symbol(highlight_symbol(theme));
+
+    let mut state = TableState::default();
+    state.select(Some(app.nav_idx));
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
+pub(super) fn render_footer(
+    frame: &mut Frame<'_>,
+    app: &App,
+    data: &UiData,
+    area: Rect,
+    theme: &super::theme::Theme,
+) {
+    let current_app_routed = data
+        .proxy
+        .routes_current_app_through_proxy(&app.app_type)
+        .unwrap_or(false);
+    let app_supports_proxy_control = data.proxy.takeover_enabled_for(&app.app_type).is_some();
+    let proxy_action_available = matches!(app.route, Route::Main)
+        && app_supports_proxy_control
+        && (!data.proxy.running || data.proxy.managed_runtime || current_app_routed);
+    let proxy_footer_label = if current_app_routed {
+        texts::tui_key_proxy_off()
+    } else {
+        texts::tui_key_proxy_on()
+    };
+
+    let spans = if app.filter.active {
+        vec![Span::styled(
+            texts::tui_footer_filter_mode(),
+            Style::default().fg(theme.dim),
+        )]
+    } else if theme.no_color {
+        let proxy_segment = if proxy_action_available {
+            format!("P {}  ", proxy_footer_label)
+        } else {
+            String::new()
+        };
+        vec![Span::styled(
+            format!(
+                "{}  {}{}",
+                texts::tui_footer_nav_keys(),
+                proxy_segment,
+                texts::tui_footer_action_keys_global(),
+            ),
+            Style::default(),
+        )]
+    } else {
+        // Two chip families from the shared theme: nav keys on the muted
+        // comment blue, action keys on the same surface used by the page
+        // key bars, so the footer reads as part of one system.
+        let nav_key_style = Style::default()
+            .fg(theme.on_comment)
+            .bg(theme.comment)
+            .add_modifier(Modifier::BOLD);
+        let nav_desc_style = Style::default().fg(theme.on_comment).bg(theme.comment);
+        let act_key_style = Style::default()
+            .fg(theme.fg_strong)
+            .bg(theme.surface)
+            .add_modifier(Modifier::BOLD);
+        let act_desc_style = Style::default().fg(theme.fg_strong).bg(theme.surface);
+        let nav_sep = Span::styled("  ", nav_desc_style);
+        let act_sep = Span::styled("  ", act_desc_style);
+
+        let nav_items: &[(&str, &str)] = if i18n::is_chinese() {
+            &[("←→", "菜单/内容"), ("↑↓", "移动")]
+        } else {
+            &[("←→", "menu/content"), ("↑↓", "move")]
+        };
+
+        let act_items_base: &[(&str, &str)] = if i18n::is_chinese() {
+            &[
+                ("[ ]", "切换应用"),
+                ("/", "过滤"),
+                ("Esc", "返回"),
+                ("?", "帮助"),
+            ]
+        } else {
+            &[
+                ("[ ]", "switch app"),
+                ("/", "filter"),
+                ("Esc", "back"),
+                ("?", "help"),
+            ]
+        };
+
+        let mut act_items = act_items_base.to_vec();
+        if proxy_action_available {
+            act_items.insert(0, ("P", proxy_footer_label));
+        }
+
+        let mut v = Vec::new();
+        for (i, (key, desc)) in nav_items.iter().enumerate() {
+            if i > 0 {
+                v.push(nav_sep.clone());
+            }
+            v.push(Span::styled(format!(" {} ", key), nav_key_style));
+            v.push(Span::styled(format!(" {}", desc), nav_desc_style));
+        }
+        v.push(Span::styled(" ", nav_desc_style));
+        // gap between blocks
+        v.push(Span::raw(" "));
+        for (i, (key, desc)) in act_items.iter().enumerate() {
+            if i > 0 {
+                v.push(act_sep.clone());
+            }
+            v.push(Span::styled(format!(" {} ", key), act_key_style));
+            v.push(Span::styled(format!(" {}", desc), act_desc_style));
+        }
+        v.push(Span::styled(" ", act_desc_style));
+        v
+    };
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+pub(super) fn render_toast(frame: &mut Frame<'_>, app: &App, theme: &super::theme::Theme) {
+    let Some(toast) = &app.toast else {
+        return;
+    };
+    if toast.action.is_some() && app.available_toast_action().is_none() {
+        return;
+    }
+
+    let content_area = content_pane_rect(frame.area(), theme);
+    let prefix = match toast.kind {
+        ToastKind::Info => texts::tui_toast_prefix_info(),
+        ToastKind::Success => texts::tui_toast_prefix_success(),
+        ToastKind::Warning => texts::tui_toast_prefix_warning(),
+        ToastKind::Error => texts::tui_toast_prefix_error(),
+    };
+    let color = if toast.action.is_some() {
+        theme.accent
+    } else {
+        transient_feedback_color(theme, &toast.kind)
+    };
+    let message = format!("{} {}", prefix.trim(), toast.message);
+    let layout_text = toast_layout_text(toast, &message);
+    let area = toast_rect(content_area, &layout_text);
+
+    frame.render_widget(Clear, area);
+
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(color).add_modifier(Modifier::BOLD))
+        .style(Style::default().bg(theme.surface));
+    frame.render_widget(outer.clone(), area);
+
+    let inner = outer.inner(area);
+    let text_style = if theme.no_color {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(color)
+            .bg(theme.surface)
+            .add_modifier(Modifier::BOLD)
+    };
+
+    frame.render_widget(
+        Paragraph::new(toast_content_lines(
+            toast,
+            &message,
+            inner.width,
+            inner.height,
+            theme,
+            text_style,
+        ))
+        .alignment(Alignment::Center)
+        .style(text_style)
+        .wrap(Wrap { trim: false }),
+        inner,
+    );
+}
+
+fn toast_action_label(action: &ToastAction) -> &'static str {
+    match action {
+        ToastAction::CopyToClipboard { .. } => texts::tui_key_copy(),
+    }
+}
+
+fn toast_action_text(action: &ToastAction) -> String {
+    format!(" {} {} ", action.shortcut(), toast_action_label(action))
+}
+
+fn toast_action_preview(toast: &Toast) -> Option<String> {
+    let text = toast.copy_text()?;
+    let preview = text
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>();
+    Some(if preview.is_empty() {
+        "—".to_string()
+    } else {
+        preview
+    })
+}
+
+pub(super) fn toast_layout_text(toast: &Toast, message: &str) -> String {
+    let (Some(action), Some(preview)) = (toast.action.as_ref(), toast_action_preview(toast)) else {
+        return message.to_string();
+    };
+    format!("{message}\n{preview}\n\n{}", toast_action_text(action))
+}
+
+pub(super) fn toast_content_lines(
+    toast: &Toast,
+    message: &str,
+    width: u16,
+    height: u16,
+    theme: &super::theme::Theme,
+    message_style: Style,
+) -> Vec<Line<'static>> {
+    let Some(action) = toast.action.as_ref() else {
+        return centered_message_lines(message, width, height);
+    };
+
+    let mut message_lines = wrap_message_lines(message, width)
+        .into_iter()
+        .map(|line| Line::styled(line, message_style))
+        .collect::<Vec<_>>();
+
+    let mut preview_lines = Vec::new();
+    if let Some(preview) = toast_action_preview(toast) {
+        let preview_style = if theme.no_color {
+            Style::default()
+        } else {
+            Style::default().fg(theme.fg_strong).bg(theme.surface)
+        };
+        preview_lines.extend(
+            wrap_message_lines(&preview, width)
+                .into_iter()
+                .map(|line| Line::styled(line, preview_style)),
+        );
+    }
+
+    let action_text = truncate_to_display_width(&toast_action_text(action), width);
+    let action_line = Line::styled(action_text, active_chip_style(theme));
+    let max_lines = usize::from(height);
+    if max_lines == 0 {
+        return Vec::new();
+    }
+    let footer_height = if max_lines >= 3 { 2 } else { 1 };
+    let body_height = max_lines.saturating_sub(footer_height);
+    if message_lines.len().saturating_add(preview_lines.len()) > body_height {
+        preview_lines.truncate(body_height);
+        message_lines.truncate(body_height.saturating_sub(preview_lines.len()));
+    }
+    message_lines.extend(preview_lines);
+    let body_lines = message_lines;
+
+    let unused_body_rows = body_height.saturating_sub(body_lines.len());
+    let body_top_padding = unused_body_rows / 2;
+    let body_bottom_padding = unused_body_rows.saturating_sub(body_top_padding);
+    let mut lines = Vec::with_capacity(max_lines);
+    lines.extend((0..body_top_padding).map(|_| Line::raw("")));
+    lines.extend(body_lines);
+    lines.extend((0..body_bottom_padding).map(|_| Line::raw("")));
+    if footer_height == 2 {
+        lines.push(Line::raw(""));
+    }
+    lines.push(action_line);
+    lines
+}
+
+pub(super) fn toast_rect(content_area: Rect, message: &str) -> Rect {
+    let max_width = content_area
+        .width
+        .saturating_sub(4)
+        .clamp(1, TOAST_MAX_WIDTH);
+    let min_width = TOAST_MIN_WIDTH.min(max_width);
+    let content_width = message
+        .lines()
+        .map(UnicodeWidthStr::width)
+        .max()
+        .unwrap_or(0) as u16;
+    let width = content_width.saturating_add(8).clamp(min_width, max_width);
+
+    let inner_width = width.saturating_sub(2).max(1);
+    let wrapped_lines = wrap_message_lines(message, inner_width).len() as u16;
+    let max_height = content_area.height.saturating_sub(4).max(1);
+    let min_height = TOAST_MIN_HEIGHT.min(max_height);
+    let height = wrapped_lines
+        .saturating_add(2)
+        .max(min_height)
+        .min(max_height);
+
+    centered_rect_fixed(width, height, content_area)
+}

@@ -1,0 +1,761 @@
+use super::*;
+
+#[derive(Debug, Clone)]
+pub enum Action {
+    None,
+    #[allow(dead_code)]
+    ReloadData,
+    SwitchRoute(Route),
+    Quit,
+    SetAppType(AppType),
+    LocalEnvRefresh,
+    CopyToClipboard {
+        text: String,
+    },
+
+    SessionsRefresh,
+    SessionsDeepSearch {
+        query: String,
+    },
+    SessionsDeepSearchCancel,
+    SessionsProjectCatalogLoad,
+    SessionsProjectFilter {
+        query: String,
+    },
+    SessionsProjectFilterCancel,
+    SessionsProjectApply {
+        scope: crate::session_manager::project_scope::SessionProjectScope,
+    },
+    SessionMessagesLoad {
+        key: String,
+        provider_id: String,
+        source_path: String,
+    },
+    SessionResume {
+        command: String,
+        cwd: Option<String>,
+    },
+    SessionDelete {
+        key: String,
+        provider_id: String,
+        session_id: String,
+        source_path: String,
+    },
+
+    SkillsToggle {
+        directory: String,
+        enabled: bool,
+    },
+    SkillsSetApps {
+        directory: String,
+        apps: crate::app_config::SkillApps,
+    },
+    SkillsInstall {
+        spec: String,
+    },
+    SkillsCheckUpdates,
+    SkillsUpdate {
+        ids: Vec<String>,
+    },
+    SkillsUninstall {
+        directory: String,
+    },
+    SkillsSync {
+        app: Option<AppType>,
+    },
+    SkillsSetSyncMethod {
+        method: SyncMethod,
+    },
+    SkillsDiscover {
+        query: String,
+        source: SkillsDiscoverSource,
+        force: bool,
+    },
+    SkillsRepoAdd {
+        spec: String,
+    },
+    SkillsRepoRemove {
+        owner: String,
+        name: String,
+    },
+    SkillsRepoToggleEnabled {
+        owner: String,
+        name: String,
+        enabled: bool,
+    },
+    SkillsOpenImport,
+    #[allow(dead_code)]
+    SkillsScanUnmanaged,
+    SkillsImportFromApps {
+        imports: Vec<crate::services::skill::ImportSkillSelection>,
+    },
+
+    ProviderSwitch {
+        id: String,
+    },
+    ProviderRemoveFromConfig {
+        id: String,
+    },
+    ProviderSetDefaultModel {
+        provider_id: String,
+        model_id: String,
+    },
+    ProviderImportLiveConfig,
+    ProviderDelete {
+        id: String,
+    },
+    ProviderSpeedtest {
+        url: String,
+    },
+    ProviderLaunchTemporary {
+        id: String,
+    },
+    ProviderStreamCheck {
+        id: String,
+    },
+    ProviderSetFailoverQueue {
+        id: String,
+        enabled: bool,
+    },
+    ProviderMoveFailoverQueue {
+        id: String,
+        direction: MoveDirection,
+    },
+    ProviderQuotaRefresh {
+        id: String,
+    },
+    ProviderModelFetch {
+        base_url: String,
+        is_full_url: bool,
+        api_key: Option<String>,
+        custom_user_agent: Option<String>,
+        codex_oauth: bool,
+        codex_oauth_account_id: Option<String>,
+        field: ProviderAddField,
+        claude_idx: Option<usize>,
+    },
+    UsageCustomRange {
+        range: data::UsageCustomRange,
+    },
+    UsageRefresh,
+    UsageRebuildCodex,
+    UsageLogDetailRefresh {
+        rowid: i64,
+    },
+    PricingDelete {
+        model_id: String,
+    },
+
+    ManagedAuthRefresh {
+        auth_provider: String,
+    },
+    ManagedAuthStartLogin {
+        auth_provider: String,
+    },
+    ManagedAuthSetDefault {
+        auth_provider: String,
+        account_id: String,
+    },
+    ManagedAuthRemove {
+        auth_provider: String,
+        account_id: String,
+    },
+
+    McpToggle {
+        id: String,
+        enabled: bool,
+    },
+    McpSetApps {
+        id: String,
+        apps: crate::app_config::McpApps,
+    },
+    McpDelete {
+        id: String,
+    },
+    McpImport,
+
+    PromptActivate {
+        id: String,
+    },
+    PromptDeactivate {
+        id: String,
+    },
+    #[allow(dead_code)]
+    PromptUpdateMetadata {
+        old_id: String,
+        new_id: String,
+        name: String,
+        description: Option<String>,
+    },
+    PromptSave {
+        old_id: Option<String>,
+        new_id: String,
+        name: String,
+        description: Option<String>,
+        content: String,
+    },
+    PromptDelete {
+        id: String,
+    },
+    PromptFormOpenExternal,
+    PromptOpenImportCandidate {
+        filename: String,
+        content: String,
+    },
+
+    ConfigExport {
+        path: String,
+    },
+    ConfigImport {
+        path: String,
+    },
+    ConfigBackup {
+        name: Option<String>,
+    },
+    ConfigRestoreBackup {
+        id: String,
+    },
+    ConfigShowFull,
+    ConfigValidate,
+    ConfigOpenProxyHelp,
+    ConfirmCommonConfigNotice,
+    ConfirmUsageQueryNotice,
+    ConfigWebDavCheckConnection,
+    ConfigWebDavSave {
+        settings: crate::settings::WebDavSyncSettings,
+    },
+    ConfigWebDavUpload,
+    ConfigWebDavDownload,
+    ConfigWebDavMigrateV1ToV2,
+    ConfigWebDavReset,
+    ConfigWebDavSetEnabled {
+        enabled: bool,
+    },
+    ConfigWebDavJianguoyunQuickSetup {
+        username: String,
+        password: String,
+    },
+    ConfigS3Save {
+        settings: crate::settings::S3SyncSettings,
+    },
+    ConfigS3CheckConnection,
+    ConfigS3FetchRemoteInfo {
+        intent: CloudSyncTransferIntent,
+    },
+    ConfigS3Upload,
+    ConfigS3Download,
+    ConfigS3SetEnabled {
+        enabled: bool,
+    },
+    ConfigS3Reset,
+    OpenClawWorkspaceOpenFile {
+        filename: String,
+    },
+    OpenClawDailyMemoryOpenFile {
+        filename: String,
+    },
+    OpenClawDailyMemorySearch {
+        query: String,
+    },
+    OpenClawDailyMemoryDelete {
+        filename: String,
+    },
+    OpenClawOpenDirectory {
+        subdir: String,
+    },
+    HermesMemoryOpen {
+        kind: crate::hermes_config::MemoryKind,
+    },
+    HermesMemorySetEnabled {
+        kind: crate::hermes_config::MemoryKind,
+        enabled: bool,
+    },
+    HermesOpenMemoryDirectory,
+    ConfigReset,
+
+    EditorSubmit {
+        submit: EditorSubmit,
+        content: String,
+    },
+    EditorDiscard,
+    EditorOpenExternal,
+    EditorFormatCommonSnippet {
+        app_type: AppType,
+    },
+    EditorExtractCommonSnippet {
+        app_type: AppType,
+    },
+
+    SetSkipClaudeOnboarding {
+        enabled: bool,
+    },
+    SetClaudePluginIntegration {
+        enabled: bool,
+    },
+    SetPreserveCodexOfficialAuth {
+        enabled: bool,
+    },
+    SetCodexUnifiedSessionHistory {
+        enabled: bool,
+        migrate_existing: bool,
+        restore_after_disable: bool,
+    },
+    #[allow(dead_code)]
+    SetProxyEnabled {
+        enabled: bool,
+    },
+    SetProxyListenAddress {
+        address: String,
+    },
+    SetProxyListenPort {
+        port: u16,
+    },
+    SetProxyAutoFailover {
+        app_type: AppType,
+        enabled: bool,
+    },
+    EnableProxyAndAutoFailover {
+        app_type: AppType,
+    },
+    SetOpenClawConfigDir {
+        path: Option<String>,
+    },
+    SetPreferredEditor {
+        command: Option<String>,
+    },
+    SetManagedProxyForCurrentApp {
+        app_type: AppType,
+        enabled: bool,
+    },
+    SetLanguage(Language),
+    SetVisibleAppsMode {
+        mode: crate::settings::VisibleAppsMode,
+    },
+    SetVisibleApps {
+        apps: crate::settings::VisibleApps,
+    },
+    ConfirmVisibleAppsAutoDetection {
+        use_auto: bool,
+    },
+    SwitchVisibleAppsToManual {
+        apps: crate::settings::VisibleApps,
+        selected: usize,
+    },
+
+    CheckUpdate,
+    ConfirmUpdate,
+    CancelUpdate,
+    CancelUpdateCheck,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigItem {
+    Path,
+    ShowFull,
+    Export,
+    Import,
+    Backup,
+    Restore,
+    Validate,
+    CommonSnippet,
+    #[allow(dead_code)]
+    Proxy,
+    OpenClawWorkspace,
+    OpenClawEnv,
+    OpenClawTools,
+    OpenClawAgents,
+    CloudSync,
+    Reset,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ConfigItemMetadata {
+    pub label: &'static str,
+    pub detail_title: Option<&'static str>,
+    pub detail_route: Option<Route>,
+    pub openclaw_only: bool,
+}
+
+fn config_item_metadata(label: &'static str) -> ConfigItemMetadata {
+    ConfigItemMetadata {
+        label,
+        detail_title: None,
+        detail_route: None,
+        openclaw_only: false,
+    }
+}
+
+fn openclaw_config_item_metadata(
+    label: &'static str,
+    detail_title: &'static str,
+    detail_route: Route,
+) -> ConfigItemMetadata {
+    ConfigItemMetadata {
+        label,
+        detail_title: Some(detail_title),
+        detail_route: Some(detail_route),
+        openclaw_only: true,
+    }
+}
+
+impl ConfigItem {
+    pub const ALL: [ConfigItem; 14] = [
+        ConfigItem::Path,
+        ConfigItem::ShowFull,
+        ConfigItem::Export,
+        ConfigItem::Import,
+        ConfigItem::Backup,
+        ConfigItem::Restore,
+        ConfigItem::Validate,
+        ConfigItem::CommonSnippet,
+        ConfigItem::OpenClawWorkspace,
+        ConfigItem::OpenClawEnv,
+        ConfigItem::OpenClawTools,
+        ConfigItem::OpenClawAgents,
+        ConfigItem::CloudSync,
+        ConfigItem::Reset,
+    ];
+
+    pub(crate) fn metadata(&self) -> ConfigItemMetadata {
+        match self {
+            ConfigItem::Path => config_item_metadata(texts::tui_config_item_show_path()),
+            ConfigItem::ShowFull => config_item_metadata(texts::tui_config_item_show_full()),
+            ConfigItem::Export => config_item_metadata(texts::tui_config_item_export()),
+            ConfigItem::Import => config_item_metadata(texts::tui_config_item_import()),
+            ConfigItem::Backup => config_item_metadata(texts::tui_config_item_backup()),
+            ConfigItem::Restore => config_item_metadata(texts::tui_config_item_restore()),
+            ConfigItem::Validate => config_item_metadata(texts::tui_config_item_validate()),
+            ConfigItem::CommonSnippet => {
+                config_item_metadata(texts::tui_config_item_common_snippet())
+            }
+            ConfigItem::Proxy => config_item_metadata(texts::tui_config_item_proxy()),
+            ConfigItem::OpenClawWorkspace => openclaw_config_item_metadata(
+                texts::tui_config_item_openclaw_workspace(),
+                texts::tui_openclaw_workspace_title(),
+                Route::ConfigOpenClawWorkspace,
+            ),
+            ConfigItem::OpenClawEnv => openclaw_config_item_metadata(
+                texts::tui_config_item_openclaw_env(),
+                texts::tui_openclaw_config_env_title(),
+                Route::ConfigOpenClawEnv,
+            ),
+            ConfigItem::OpenClawTools => openclaw_config_item_metadata(
+                texts::tui_config_item_openclaw_tools(),
+                texts::tui_openclaw_config_tools_title(),
+                Route::ConfigOpenClawTools,
+            ),
+            ConfigItem::OpenClawAgents => openclaw_config_item_metadata(
+                texts::tui_config_item_openclaw_agents(),
+                texts::tui_openclaw_config_agents_title(),
+                Route::ConfigOpenClawAgents,
+            ),
+            ConfigItem::CloudSync => config_item_metadata(texts::tui_config_item_cloud_sync()),
+            ConfigItem::Reset => config_item_metadata(texts::tui_config_item_reset()),
+        }
+    }
+
+    pub(crate) fn visible_for_app(&self, app_type: &AppType) -> bool {
+        !self.metadata().openclaw_only || matches!(app_type, AppType::OpenClaw)
+    }
+
+    pub(crate) fn listed_in_config_menu(&self, app_type: &AppType) -> bool {
+        self.visible_for_app(app_type)
+            && !matches!(
+                self,
+                ConfigItem::OpenClawWorkspace
+                    | ConfigItem::OpenClawEnv
+                    | ConfigItem::OpenClawTools
+                    | ConfigItem::OpenClawAgents
+            )
+    }
+
+    pub(crate) fn label(&self) -> &'static str {
+        self.metadata().label
+    }
+
+    pub(crate) fn detail_title(&self) -> Option<&'static str> {
+        self.metadata().detail_title
+    }
+
+    pub(crate) fn detail_route(&self) -> Option<Route> {
+        self.metadata().detail_route
+    }
+
+    pub(crate) fn from_openclaw_route(route: &Route) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|item| item.detail_route().as_ref() == Some(route))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsItem {
+    Language,
+    Theme,
+    Icons,
+    PreferredEditor,
+    VisibleAppsMode,
+    VisibleApps,
+    OpenClawConfigDir,
+    ManagedAccounts,
+    SkipClaudeOnboarding,
+    ClaudePluginIntegration,
+    PreserveCodexOfficialAuth,
+    CodexUnifiedSessionHistory,
+    Proxy,
+    CheckForUpdates,
+}
+
+impl SettingsItem {
+    pub const ALL: [SettingsItem; 14] = [
+        SettingsItem::ManagedAccounts,
+        SettingsItem::Language,
+        SettingsItem::Theme,
+        SettingsItem::Icons,
+        SettingsItem::PreferredEditor,
+        SettingsItem::VisibleAppsMode,
+        SettingsItem::VisibleApps,
+        SettingsItem::OpenClawConfigDir,
+        SettingsItem::SkipClaudeOnboarding,
+        SettingsItem::ClaudePluginIntegration,
+        SettingsItem::PreserveCodexOfficialAuth,
+        SettingsItem::CodexUnifiedSessionHistory,
+        SettingsItem::Proxy,
+        SettingsItem::CheckForUpdates,
+    ];
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalProxySettingsItem {
+    ListenAddress,
+    ListenPort,
+    AutoFailover,
+}
+
+impl LocalProxySettingsItem {
+    pub const ALL: [LocalProxySettingsItem; 3] = [
+        LocalProxySettingsItem::ListenAddress,
+        LocalProxySettingsItem::ListenPort,
+        LocalProxySettingsItem::AutoFailover,
+    ];
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoveDirection {
+    Up,
+    Down,
+}
+
+#[derive(Debug, Clone)]
+pub enum WebDavConfigItem {
+    Settings,
+    CheckConnection,
+    Upload,
+    Download,
+    EnableDisable,
+    Reset,
+    JianguoyunQuickSetup,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloudSyncBackend {
+    WebDav,
+    S3Compatible,
+}
+
+impl CloudSyncBackend {
+    pub const ALL: [Self; 2] = [Self::WebDav, Self::S3Compatible];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::WebDav => "WebDAV",
+            Self::S3Compatible => "S3 Compatible",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloudSyncTransferIntent {
+    Upload,
+    Restore,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum S3ConfigItem {
+    Configure,
+    CheckConnection,
+    Upload,
+    Restore,
+    EnableDisable,
+    Reset,
+}
+
+impl S3ConfigItem {
+    pub const ALL: [Self; 6] = [
+        Self::Configure,
+        Self::CheckConnection,
+        Self::Upload,
+        Self::Restore,
+        Self::EnableDisable,
+        Self::Reset,
+    ];
+
+    pub(crate) fn label(self, enabled: bool) -> &'static str {
+        match self {
+            Self::Configure => texts::tui_config_item_s3_configure(),
+            Self::CheckConnection => texts::tui_config_item_s3_check_connection(),
+            Self::Upload => texts::tui_config_item_s3_upload(),
+            Self::Restore => texts::tui_config_item_s3_restore(),
+            Self::EnableDisable if enabled => texts::tui_config_item_s3_disable(),
+            Self::EnableDisable => texts::tui_config_item_s3_enable(),
+            Self::Reset => texts::tui_config_item_s3_reset(),
+        }
+    }
+
+    pub(crate) fn available(self, configured: bool, enabled: bool) -> bool {
+        match self {
+            Self::Configure => true,
+            Self::CheckConnection | Self::EnableDisable | Self::Reset => configured,
+            Self::Upload | Self::Restore => configured && enabled,
+        }
+    }
+}
+
+impl WebDavConfigItem {
+    pub const ALL: [WebDavConfigItem; 7] = [
+        WebDavConfigItem::Settings,
+        WebDavConfigItem::CheckConnection,
+        WebDavConfigItem::Upload,
+        WebDavConfigItem::Download,
+        WebDavConfigItem::EnableDisable,
+        WebDavConfigItem::Reset,
+        WebDavConfigItem::JianguoyunQuickSetup,
+    ];
+
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            WebDavConfigItem::Settings => texts::tui_config_item_webdav_settings(),
+            WebDavConfigItem::CheckConnection => texts::tui_config_item_webdav_check_connection(),
+            WebDavConfigItem::Upload => texts::tui_config_item_webdav_upload(),
+            WebDavConfigItem::Download => texts::tui_config_item_webdav_download(),
+            WebDavConfigItem::EnableDisable => texts::tui_config_item_webdav_enable(),
+            WebDavConfigItem::Reset => texts::tui_config_item_webdav_reset(),
+            WebDavConfigItem::JianguoyunQuickSetup => {
+                texts::tui_config_item_webdav_jianguoyun_quick_setup()
+            }
+        }
+    }
+
+    pub(crate) fn available(&self, configured: bool, enabled: bool) -> bool {
+        match self {
+            Self::Settings | Self::JianguoyunQuickSetup => true,
+            Self::CheckConnection | Self::EnableDisable | Self::Reset => configured,
+            Self::Upload | Self::Download => configured && enabled,
+        }
+    }
+}
+
+pub(crate) const PROXY_HERO_TRANSITION_TICKS: u64 = 10;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProxyVisualTransition {
+    pub from_on: bool,
+    pub to_on: bool,
+    pub started_tick: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct App {
+    pub app_type: AppType,
+    pub route: Route,
+    pub route_stack: Vec<Route>,
+    pub focus: Focus,
+    pub nav_idx: usize,
+
+    pub filter: FilterState,
+    pub editor: Option<EditorState>,
+    pub form: Option<FormState>,
+    pub pending_overlay: Option<Overlay>,
+    pub overlay: Overlay,
+    pub toast: Option<Toast>,
+    pub should_quit: bool,
+    /// When set, the main loop should fire a SessionsDeepSearch action.
+    pub pending_deep_search: Option<String>,
+    /// A project picker opened before the current base manifest was ready.
+    pub pending_project_catalog: bool,
+    /// Latest picker query waiting for a current project catalog/worker lane.
+    pub pending_project_filter: Option<String>,
+    pub last_size: Size,
+    pub tick: u64,
+    pub proxy_input_activity_samples: Vec<u64>,
+    pub proxy_output_activity_samples: Vec<u64>,
+    pub proxy_activity_last_input_tokens: Option<u64>,
+    pub proxy_activity_last_output_tokens: Option<u64>,
+    pub proxy_visual_state: Option<bool>,
+    pub proxy_visual_transition: Option<ProxyVisualTransition>,
+    pub quota_auto_target_key: Option<String>,
+    pub quota_last_auto_tick: Option<u64>,
+    /// Tick of the last periodic session-usage sync, seeded on the first check
+    /// so the interval is measured from TUI start rather than firing at once.
+    pub usage_last_auto_sync_tick: Option<u64>,
+    /// Proxy snapshots mark this when the current app persisted new token
+    /// activity. The main loop consumes it on a throttled aggregate refresh.
+    pub usage_proxy_activity_dirty: bool,
+    pub usage_last_proxy_refresh_tick: Option<u64>,
+    /// Tick the currently running session-usage sync round started at, or
+    /// `None` while no round is in flight. Refresh indicators stay numberless
+    /// until a round outlives the escalation threshold; see
+    /// `ui::shared::sync_escalation`.
+    pub usage_sync_round_started_tick: Option<u64>,
+    pub prompt_import_prompted_apps: HashSet<String>,
+    pub common_config_notice_confirmed: bool,
+    pub usage_query_notice_confirmed: bool,
+
+    pub local_env_results: Vec<crate::services::local_env_check::ToolCheckResult>,
+    pub local_env_pending: HashSet<crate::services::local_env_check::LocalTool>,
+    pub local_env_generation: u64,
+
+    pub usage: UsageState,
+    pub pricing: PricingState,
+    pub sessions: SessionsState,
+    pub provider_idx: usize,
+    pub mcp_idx: usize,
+    pub prompt_idx: usize,
+    pub skills_idx: usize,
+    pub skills_discover_idx: usize,
+    pub skills_repo_idx: usize,
+    pub skills_unmanaged_idx: usize,
+    pub skill_updates: HashMap<String, crate::services::skill::SkillUpdateInfo>,
+    pub skills_discover_results: Vec<crate::services::skill::Skill>,
+    pub skills_discover_query: String,
+    pub skills_discover_source: SkillsDiscoverSource,
+    pub skills_discover_loading: bool,
+    pub skills_discover_request_id: u64,
+    pub skills_discover_active_request_id: Option<u64>,
+    pub skills_discover_cache:
+        HashMap<(SkillsDiscoverSource, String), Vec<crate::services::skill::Skill>>,
+    pub skills_unmanaged_results: Vec<crate::services::skill::UnmanagedSkill>,
+    pub skills_unmanaged_selected: HashSet<String>,
+    pub config_idx: usize,
+    pub workspace_idx: usize,
+    pub daily_memory_idx: usize,
+    pub hermes_memory_idx: usize,
+    pub openclaw_tools_form: Option<OpenClawToolsFormState>,
+    pub openclaw_agents_form: Option<OpenClawAgentsFormState>,
+    pub openclaw_daily_memory_search_query: String,
+    pub openclaw_daily_memory_search_results:
+        Vec<crate::commands::workspace::DailyMemorySearchResult>,
+    pub config_webdav_idx: usize,
+    pub config_cloud_sync_idx: usize,
+    pub config_s3_idx: usize,
+    pub webdav_quick_setup_username: Option<String>,
+    #[allow(dead_code)]
+    pub language_idx: usize,
+    pub settings_idx: usize,
+    pub settings_proxy_idx: usize,
+    pub settings_managed_accounts_idx: usize,
+    pub managed_auth_status: Option<crate::services::ManagedAuthStatus>,
+    pub managed_auth_loading: bool,
+    pub managed_auth_login: Option<ManagedAuthLoginState>,
+}

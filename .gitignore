@@ -117,7 +117,7 @@ dist
 #Added by cargo
 
 /target
-Cargo.lock
+!vendor/cc-switch-cli/src-tauri/Cargo.lock
 
 *.node
 .pnp.*

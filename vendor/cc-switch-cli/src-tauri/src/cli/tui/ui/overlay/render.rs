@@ -1,0 +1,359 @@
+use super::super::theme;
+use super::super::*;
+
+pub(crate) fn render_overlay(
+    frame: &mut Frame<'_>,
+    app: &App,
+    data: &UiData,
+    theme: &theme::Theme,
+) {
+    let content_area = content_pane_rect(frame.area(), theme);
+
+    match &app.overlay {
+        Overlay::None => {}
+        Overlay::Help(help) => super::basic::render_help_overlay(frame, content_area, theme, help),
+        Overlay::Confirm(confirm) => {
+            super::basic::render_confirm_overlay(frame, content_area, theme, confirm)
+        }
+        Overlay::CodexHistoryConfirm(confirm) => {
+            super::basic::render_codex_history_confirm_overlay(frame, content_area, theme, confirm)
+        }
+        Overlay::TextInput(input) => {
+            super::basic::render_text_input_overlay(frame, content_area, theme, input)
+        }
+        Overlay::BackupPicker { selected } => {
+            super::basic::render_backup_picker_overlay(frame, data, content_area, theme, *selected)
+        }
+        Overlay::TextView(view) => super::basic::render_text_view_overlay(
+            frame,
+            content_area,
+            theme,
+            &view.title,
+            &view.lines,
+            view.scroll,
+            view.action.is_some(),
+        ),
+        Overlay::CommonSnippetPicker { selected } => {
+            super::basic::render_common_snippet_picker_overlay(
+                frame,
+                content_area,
+                theme,
+                *selected,
+            )
+        }
+        Overlay::ProviderTestMenu {
+            provider_id,
+            selected,
+        } => super::pickers::render_provider_test_menu_overlay(
+            frame,
+            app,
+            data,
+            content_area,
+            theme,
+            provider_id,
+            *selected,
+        ),
+        Overlay::FailoverQueueManager {
+            selected_provider_id,
+        } => super::pickers::render_failover_queue_manager_overlay(
+            frame,
+            data,
+            content_area,
+            theme,
+            selected_provider_id.as_deref(),
+        ),
+        Overlay::ClaudeModelPicker {
+            selected,
+            column,
+            editing,
+        } => super::pickers::render_claude_model_picker_overlay(
+            frame,
+            app,
+            content_area,
+            theme,
+            *selected,
+            *column,
+            *editing,
+        ),
+        Overlay::ClaudeApiFormatPicker { selected } => {
+            super::pickers::render_claude_api_format_picker_overlay(
+                frame,
+                app,
+                content_area,
+                theme,
+                *selected,
+            )
+        }
+        Overlay::UserAgentPicker { selected } => super::pickers::render_user_agent_picker_overlay(
+            frame,
+            app,
+            content_area,
+            theme,
+            *selected,
+        ),
+        Overlay::ExternalEditorPicker { selected, editors } => {
+            super::pickers::render_external_editor_picker_overlay(
+                frame,
+                content_area,
+                theme,
+                *selected,
+                editors,
+            )
+        }
+        Overlay::UsageQueryTemplatePicker { selected } => {
+            super::pickers::render_usage_query_template_picker_overlay(
+                frame,
+                app,
+                content_area,
+                theme,
+                *selected,
+            )
+        }
+        Overlay::S3PresetPicker { selected } => super::pickers::render_s3_preset_picker_overlay(
+            frame,
+            app,
+            content_area,
+            theme,
+            *selected,
+        ),
+        Overlay::ManagedAccountPicker {
+            selected,
+            binding,
+            selected_account_id,
+            ..
+        } => super::pickers::render_managed_account_picker_overlay(
+            frame,
+            app,
+            content_area,
+            theme,
+            *selected,
+            *binding,
+            selected_account_id.as_deref(),
+        ),
+        Overlay::ManagedAccountActionPicker {
+            account_id,
+            selected,
+            ..
+        } => super::pickers::render_managed_account_action_picker_overlay(
+            frame,
+            app,
+            content_area,
+            theme,
+            account_id,
+            *selected,
+        ),
+        Overlay::HermesModelsPicker { editing } => {
+            super::pickers::render_hermes_models_picker_overlay(
+                frame,
+                app,
+                content_area,
+                theme,
+                *editing,
+            )
+        }
+        Overlay::ModelFetchPicker {
+            input,
+            fetching,
+            models,
+            filtered_indices,
+            filter_incomplete,
+            error,
+            selected_idx,
+            ..
+        } => super::pickers::render_model_fetch_picker_overlay(
+            frame,
+            content_area,
+            theme,
+            input,
+            *fetching,
+            models,
+            filtered_indices.as_deref(),
+            *filter_incomplete,
+            error.as_deref(),
+            *selected_idx,
+        ),
+        Overlay::SessionProjectPicker(picker) => {
+            super::pickers::render_session_project_picker_overlay(
+                frame,
+                app,
+                content_area,
+                theme,
+                picker,
+            )
+        }
+        Overlay::OpenClawToolsProfilePicker { selected } => {
+            super::pickers::render_openclaw_tools_profile_picker_overlay(
+                frame,
+                app,
+                content_area,
+                theme,
+                *selected,
+            )
+        }
+        Overlay::OpenClawAgentsFallbackPicker {
+            selected,
+            active,
+            options,
+            ..
+        } => super::pickers::render_openclaw_agents_fallback_picker_overlay(
+            frame,
+            app,
+            content_area,
+            theme,
+            *selected,
+            *active,
+            options,
+        ),
+        Overlay::McpAppsPicker {
+            name,
+            selected,
+            apps,
+            ..
+        } => super::pickers::render_mcp_apps_picker_overlay(
+            frame,
+            content_area,
+            theme,
+            name,
+            *selected,
+            apps,
+        ),
+        Overlay::McpTypePicker { selected } => {
+            super::pickers::render_mcp_type_picker_overlay(frame, content_area, theme, *selected)
+        }
+        Overlay::VisibleAppsPicker { selected, apps } => {
+            super::pickers::render_visible_apps_picker_overlay(
+                frame,
+                content_area,
+                theme,
+                *selected,
+                apps,
+            )
+        }
+        Overlay::SkillsAppsPicker {
+            name,
+            selected,
+            apps,
+            ..
+        } => super::pickers::render_skills_apps_picker_overlay(
+            frame,
+            content_area,
+            theme,
+            name,
+            *selected,
+            apps,
+        ),
+        Overlay::SkillsImportPicker {
+            skills,
+            selected_idx,
+            selected,
+        } => super::pickers::render_skills_import_picker_overlay(
+            frame,
+            content_area,
+            theme,
+            skills,
+            *selected_idx,
+            selected,
+        ),
+        Overlay::SkillsSyncMethodPicker { selected } => {
+            super::pickers::render_skills_sync_method_picker_overlay(
+                frame,
+                data,
+                content_area,
+                theme,
+                *selected,
+            )
+        }
+        Overlay::McpKeyValuePicker { kind, selected } => {
+            super::mcp_key_value::render_mcp_key_value_picker_overlay(
+                frame,
+                app,
+                content_area,
+                theme,
+                *kind,
+                *selected,
+            )
+        }
+        Overlay::McpKeyValueEntryEditor(_) => {
+            super::mcp_key_value::render_mcp_key_value_entry_editor_overlay(
+                frame,
+                content_area,
+                theme,
+                &app.overlay,
+            )
+        }
+        Overlay::Loading {
+            kind,
+            title,
+            message,
+        } => super::status::render_loading_overlay(
+            frame,
+            app,
+            content_area,
+            theme,
+            *kind,
+            title,
+            message,
+        ),
+        Overlay::SpeedtestRunning { url } => {
+            super::status::render_speedtest_running_overlay(frame, content_area, theme, url)
+        }
+        Overlay::SpeedtestResult { url, lines, scroll } => {
+            super::status::render_speedtest_result_overlay(
+                frame,
+                content_area,
+                theme,
+                url,
+                lines,
+                *scroll,
+            )
+        }
+        Overlay::StreamCheckRunning { provider_name, .. } => {
+            super::status::render_stream_check_running_overlay(
+                frame,
+                content_area,
+                theme,
+                provider_name,
+            )
+        }
+        Overlay::StreamCheckResult {
+            provider_name,
+            lines,
+            scroll,
+        } => super::status::render_stream_check_result_overlay(
+            frame,
+            content_area,
+            theme,
+            provider_name,
+            lines,
+            *scroll,
+        ),
+        Overlay::UpdateAvailable {
+            current,
+            latest,
+            selected,
+        } => super::status::render_update_available_overlay(
+            frame,
+            content_area,
+            theme,
+            current,
+            latest,
+            *selected,
+        ),
+        Overlay::UpdateDownloading { downloaded, total } => {
+            super::status::render_update_downloading_overlay(
+                frame,
+                content_area,
+                theme,
+                *downloaded,
+                *total,
+            )
+        }
+        Overlay::UpdateResult { success, message } => super::status::render_update_result_overlay(
+            frame,
+            content_area,
+            theme,
+            *success,
+            message,
+        ),
+    }
+}

@@ -1,0 +1,1556 @@
+use futures::executor::block_on;
+use serde_json::json;
+use std::{fs, path::Path};
+
+use cc_switch_lib::{
+    get_claude_settings_path, read_json_file, AppError, AppType, ConfigService, Database,
+    MultiAppConfig, Provider, ProviderMeta, ProviderService,
+};
+
+#[path = "support.rs"]
+mod support;
+use support::{ensure_test_home, lock_test_mutex, reset_test_fs, state_from_config};
+
+#[test]
+fn sync_claude_provider_writes_live_settings() {
+    let _guard = lock_test_mutex();
+    reset_test_fs();
+    let home = ensure_test_home();
+
+    let mut config = MultiAppConfig::default();
+    let provider_config = json!({
+        "env": {
+            "ANTHROPIC_AUTH_TOKEN": "test-key",
+            "ANTHROPIC_BASE_URL": "https://api.test"
+        },
+        "ui": {
+            "displayName": "Test Provider"
+        }
+    });
+
+    let provider = Provider::with_id(
+        "prov-1".to_string(),
+        "Test Claude".to_string(),
+        provider_config.clone(),
+        None,
+    );
+
+    let manager = config
+        .get_manager_mut(&AppType::Claude)
+        .expect("claude manager");
+    manager.providers.insert("prov-1".to_string(), provider);
+    manager.current = "prov-1".to_string();
+
+    ConfigService::sync_current_providers_to_live(&mut config).expect("sync live settings");
+
+    let settings_path = get_claude_settings_path();
+    assert!(
+        settings_path.exists(),
+        "live settings should be written to {}",
+        settings_path.display()
+    );
+
+    let live_value: serde_json::Value = read_json_file(&settings_path).expect("read live file");
+    assert_eq!(live_value, provider_config);
+
+    // 确认 SSOT 中的供应商也同步了最新内容
+    let updated = config
+        .get_manager(&AppType::Claude)
+        .and_then(|m| m.providers.get("prov-1"))
+        .expect("provider in config");
+    assert_eq!(updated.settings_config, provider_config);
+
+    // 额外确认写入位置位于测试 HOME 下
+    assert!(
+        settings_path.starts_with(home),
+        "settings path {settings_path:?} should reside under test HOME {home:?}"
+    );
+}
+
+#[test]
+fn sync_codex_provider_writes_auth_and_config() {
+    let _guard = lock_test_mutex();
+    reset_test_fs();
+
+    let mut config = MultiAppConfig::default();
+
+    // 添加入测 MCP 启用项，确保 sync_enabled_to_codex 会写入 TOML
+    config.mcp.codex.servers.insert(
+        "echo-server".into(),
+        json!({
+            "id": "echo-server",
+            "enabled": true,
+            "server": {
+                "type": "stdio",
+                "command": "echo",
+                "args": ["hello"]
+            }
+        }),
+    );
+
+    let provider_config = json!({
+        "auth": {
+            "OPENAI_API_KEY": "codex-key"
+        },
+        "config": r#"base_url = "https://codex.test""#
+    });
+
+    let provider = Provider::with_id(
+        "codex-1".to_string(),
+        "Codex Test".to_string(),
+        provider_config.clone(),
+        None,
+    );
+
+    let manager = config
+        .get_manager_mut(&AppType::Codex)
+        .expect("codex manager");
+    manager.providers.insert("codex-1".to_string(), provider);
+    manager.current = "codex-1".to_string();
+
+    ConfigService::sync_current_providers_to_live(&mut config).expect("sync codex live");
+
+    let auth_path = cc_switch_lib::get_codex_auth_path();
+    let config_path = cc_switch_lib::get_codex_config_path();
+
+    assert!(
+        auth_path.exists(),
+        "auth.json should be refreshed by third-party provider sync at {}",
+        auth_path.display()
+    );
+    let auth: serde_json::Value = read_json_file(&auth_path).expect("read auth.json");
+    assert_eq!(
+        auth.get("OPENAI_API_KEY").and_then(|value| value.as_str()),
+        Some("codex-key"),
+        "forced sync should write the current provider API key"
+    );
+    assert!(
+        config_path.exists(),
+        "config.toml should exist at {}",
+        config_path.display()
+    );
+
+    let toml_text = fs::read_to_string(&config_path).expect("read config.toml");
+    assert!(
+        toml_text.contains("command = \"echo\""),
+        "config.toml should contain serialized enabled MCP server"
+    );
+    assert!(
+        !toml_text.contains("experimental_bearer_token"),
+        "preserve disabled should keep the provider key in auth.json"
+    );
+
+    // 当前供应商应同步最新 config 文本
+    let manager = config.get_manager(&AppType::Codex).expect("codex manager");
+    let synced = manager.providers.get("codex-1").expect("codex provider");
+    let synced_cfg = synced
+        .settings_config
+        .get("config")
+        .and_then(|v| v.as_str())
+        .expect("config string");
+    assert!(
+        !synced_cfg.contains("experimental_bearer_token"),
+        "provider storage should not persist generated live bearer token"
+    );
+}
+
+#[test]
+fn sync_codex_provider_preserves_provider_model_provider_after_history_migration() {
+    let _guard = lock_test_mutex();
+    reset_test_fs();
+
+    let legacy_auth = json!({ "OPENAI_API_KEY": "rightcode-key" });
+    let legacy_config = r#"model_provider = "rightcode"
+model = "gpt-5.4"
+
+[model_providers.rightcode]
+name = "RightCode"
+base_url = "https://rightcode.example/v1"
+wire_api = "responses"
+requires_openai_auth = true
+"#;
+    cc_switch_lib::write_codex_live_atomic(&legacy_auth, Some(legacy_config))
+        .expect("seed existing Codex live config");
+
+    let mut config = MultiAppConfig::default();
+    let provider_config = json!({
+        "auth": {
+            "OPENAI_API_KEY": "fresh-key"
+        },
+        "config": r#"model_provider = "aihubmix"
+model = "gpt-5.4"
+
+[model_providers.aihubmix]
+name = "AiHubMix"
+base_url = "https://aihubmix.example/v1"
+wire_api = "responses"
+requires_openai_auth = true
+"#
+    });
+
+    let provider = Provider::with_id(
+        "codex-1".to_string(),
+        "Codex Test".to_string(),
+        provider_config,
+        None,
+    );
+
+    let manager = config
+        .get_manager_mut(&AppType::Codex)
+        .expect("codex manager");
+    manager.providers.insert("codex-1".to_string(), provider);
+    manager.current = "codex-1".to_string();
+
+    ConfigService::sync_current_providers_to_live(&mut config).expect("sync codex live");
+
+    let toml_text =
+        fs::read_to_string(cc_switch_lib::get_codex_config_path()).expect("read config.toml");
+    let parsed: toml::Value = toml::from_str(&toml_text).expect("parse config.toml");
+
+    assert_eq!(
+        parsed.get("model_provider").and_then(|v| v.as_str()),
+        Some("aihubmix"),
+        "ConfigService sync should preserve the provider template's model_provider"
+    );
+
+    let model_providers = parsed
+        .get("model_providers")
+        .and_then(|v| v.as_table())
+        .expect("model_providers should exist");
+    assert_eq!(
+        model_providers
+            .get("aihubmix")
+            .and_then(|v| v.get("base_url"))
+            .and_then(|v| v.as_str()),
+        Some("https://aihubmix.example/v1")
+    );
+
+    let synced_cfg = config
+        .get_manager(&AppType::Codex)
+        .and_then(|manager| manager.providers.get("codex-1"))
+        .and_then(|provider| provider.settings_config.get("config"))
+        .and_then(|v| v.as_str())
+        .expect("synced config string");
+    assert!(
+        synced_cfg.contains("[model_providers.aihubmix]"),
+        "ConfigService keeps syncing provider-specific config from live"
+    );
+}
+
+#[test]
+fn sync_enabled_to_codex_writes_enabled_servers() {
+    let _guard = lock_test_mutex();
+    reset_test_fs();
+
+    // Ensure ~/.codex dir exists (simulates Codex being installed)
+    let codex_dir = cc_switch_lib::get_codex_config_path();
+    if let Some(parent) = codex_dir.parent() {
+        fs::create_dir_all(parent).expect("create codex dir");
+    }
+
+    let mut config = MultiAppConfig::default();
+    config.mcp.codex.servers.insert(
+        "stdio-enabled".into(),
+        json!({
+            "id": "stdio-enabled",
+            "enabled": true,
+            "server": {
+                "type": "stdio",
+                "command": "echo",
+                "args": ["ok"],
+            }
+        }),
+    );
+
+    cc_switch_lib::sync_enabled_to_codex(&config).expect("sync codex");
+
+    let path = cc_switch_lib::get_codex_config_path();
+    assert!(path.exists(), "config.toml should be created");
+    let text = fs::read_to_string(&path).expect("read config.toml");
+    assert!(
+        text.contains("mcp_servers") && text.contains("stdio-enabled"),
+        "enabled servers should be serialized"
+    );
+}
+
+#[test]
+fn sync_enabled_to_codex_preserves_non_mcp_content_and_style() {
+    let _guard = lock_test_mutex();
+    reset_test_fs();
+
+    // 预置含有顶层注释与非 MCP 键的 config.toml
+    let path = cc_switch_lib::get_codex_config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create codex dir");
+    }
+    let seed = r#"# top-comment
+title = "keep-me"
+
+[profile]
+mode = "dev"
+"#;
+    fs::write(&path, seed).expect("seed config.toml");
+
+    // 启用一个 MCP 项，触发增量写入
+    let mut config = MultiAppConfig::default();
+    config.mcp.codex.servers.insert(
+        "echo".into(),
+        json!({
+            "id": "echo",
+            "enabled": true,
+            "server": { "type": "stdio", "command": "echo" }
+        }),
+    );
+
+    cc_switch_lib::sync_enabled_to_codex(&config).expect("sync codex");
+
+    let text = fs::read_to_string(&path).expect("read config.toml");
+    // 顶层注释与非 MCP 键应保留
+    assert!(
+        text.contains("# top-comment"),
+        "top comment should be preserved"
+    );
+    assert!(
+        text.contains("title = \"keep-me\""),
+        "top key should be preserved"
+    );
+    assert!(
+        text.contains("[profile]"),
+        "non-MCP table should be preserved"
+    );
+    assert!(
+        text.contains("mcp_servers"),
+        "mcp_servers table should be present"
+    );
+    assert!(
+        !text.contains("[mcp.servers]"),
+        "invalid [mcp.servers] table should not appear"
+    );
+    assert!(
+        text.contains("echo") && text.contains("command = \"echo\""),
+        "echo server should be serialized"
+    );
+}
+
+#[test]
+fn sync_enabled_to_codex_migrates_erroneous_mcp_dot_servers_to_mcp_servers() {
+    let _guard = lock_test_mutex();
+    reset_test_fs();
+    let path = cc_switch_lib::get_codex_config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create codex dir");
+    }
+    // 预置错误的 mcp.servers 风格（应迁移为顶层 mcp_servers）
+    let seed = r#"[mcp]
+  other = "keep"
+  [mcp.servers]
+"#;
+    fs::write(&path, seed).expect("seed config.toml");
+
+    let mut config = MultiAppConfig::default();
+    config.mcp.codex.servers.insert(
+        "echo".into(),
+        json!({
+            "id": "echo",
+            "enabled": true,
+            "server": { "type": "stdio", "command": "echo" }
+        }),
+    );
+
+    cc_switch_lib::sync_enabled_to_codex(&config).expect("sync codex");
+    let text = fs::read_to_string(&path).expect("read config.toml");
+    // 应迁移到顶层 mcp_servers，并移除错误的 mcp.servers 表
+    assert!(
+        text.contains("mcp_servers"),
+        "should migrate to mcp_servers table"
+    );
+    assert!(
+        !text.contains("[mcp.servers]"),
+        "invalid [mcp.servers] table should be removed"
+    );
+}
+
+#[test]
+fn sync_enabled_to_codex_removes_servers_when_none_enabled() {
+    let _guard = lock_test_mutex();
+    reset_test_fs();
+    let path = cc_switch_lib::get_codex_config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create codex dir");
+    }
+    fs::write(
+        &path,
+        r#"[mcp_servers]
+disabled = { type = "stdio", command = "noop" }
+"#,
+    )
+    .expect("seed config file");
+
+    let config = MultiAppConfig::default(); // 无启用项
+    cc_switch_lib::sync_enabled_to_codex(&config).expect("sync codex");
+
+    let text = fs::read_to_string(&path).expect("read config.toml");
+    assert!(
+        !text.contains("mcp_servers") && !text.contains("servers"),
+        "disabled entries should be removed from config.toml"
+    );
+}
+
+#[test]
+fn sync_enabled_to_codex_returns_error_on_invalid_toml() {
+    let _guard = lock_test_mutex();
+    reset_test_fs();
+    let path = cc_switch_lib::get_codex_config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create codex dir");
+    }
+    fs::write(&path, "invalid = [").expect("write invalid config");
+
+    let mut config = MultiAppConfig::default();
+    config.mcp.codex.servers.insert(
+        "broken".into(),
+        json!({
+            "id": "broken",
+            "enabled": true,
+            "server": {
+                "type": "stdio",
+                "command": "echo"
+            }
+        }),
+    );
+
+    let err = cc_switch_lib::sync_enabled_to_codex(&config).expect_err("sync should fail");
+    match err {
+        cc_switch_lib::AppError::Toml { path, .. } => {
+            assert!(
+                path.ends_with("config.toml"),
+                "path should reference config.toml"
+            );
+        }
+        cc_switch_lib::AppError::McpValidation(msg) => {
+            assert!(
+                msg.contains("config.toml"),
+                "error message should mention config.toml"
+            );
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn sync_codex_provider_missing_auth_returns_error() {
+    let _guard = lock_test_mutex();
+    reset_test_fs();
+
+    let mut config = MultiAppConfig::default();
+    let provider = Provider::with_id(
+        "codex-missing-auth".to_string(),
+        "No Auth".to_string(),
+        json!({
+            "config": "model = \"test\""
+        }),
+        None,
+    );
+    let manager = config
+        .get_manager_mut(&AppType::Codex)
+        .expect("codex manager");
+    manager.providers.insert(provider.id.clone(), provider);
+    manager.current = "codex-missing-auth".to_string();
+
+    let err = ConfigService::sync_current_providers_to_live(&mut config)
+        .expect_err("sync should fail when auth missing");
+    match err {
+        cc_switch_lib::AppError::Config(msg) => {
+            assert!(msg.contains("auth"), "error message should mention auth");
+        }
+        other => panic!("unexpected error variant: {other:?}"),
+    }
+
+    // 确认未产生任何 live 配置文件
+    assert!(
+        !cc_switch_lib::get_codex_auth_path().exists(),
+        "auth.json should not be created on failure"
+    );
+    assert!(
+        !cc_switch_lib::get_codex_config_path().exists(),
+        "config.toml should not be created on failure"
+    );
+}
+
+#[test]
+fn write_codex_live_atomic_persists_auth_and_config() {
+    let _guard = lock_test_mutex();
+    reset_test_fs();
+
+    let auth = json!({ "OPENAI_API_KEY": "dev-key" });
+    let config_text = r#"
+[mcp_servers.echo]
+type = "stdio"
+command = "echo"
+args = ["ok"]
+"#;
+
+    cc_switch_lib::write_codex_live_atomic(&auth, Some(config_text))
+        .expect("atomic write should succeed");
+
+    let auth_path = cc_switch_lib::get_codex_auth_path();
+    let config_path = cc_switch_lib::get_codex_config_path();
+    assert!(auth_path.exists(), "auth.json should be created");
+    assert!(config_path.exists(), "config.toml should be created");
+
+    let stored_auth: serde_json::Value =
+        cc_switch_lib::read_json_file(&auth_path).expect("read auth");
+    assert_eq!(stored_auth, auth, "auth.json should match input");
+
+    let stored_config = std::fs::read_to_string(&config_path).expect("read config");
+    assert!(
+        stored_config.contains("mcp_servers.echo"),
+        "config.toml should contain serialized table"
+    );
+}
+
+#[test]
+fn write_codex_live_atomic_rolls_back_auth_when_config_write_fails() {
+    let _guard = lock_test_mutex();
+    reset_test_fs();
+
+    let auth_path = cc_switch_lib::get_codex_auth_path();
+    if let Some(parent) = auth_path.parent() {
+        std::fs::create_dir_all(parent).expect("create codex dir");
+    }
+    std::fs::write(&auth_path, r#"{"OPENAI_API_KEY":"legacy"}"#).expect("seed auth");
+
+    let config_path = cc_switch_lib::get_codex_config_path();
+    std::fs::create_dir_all(&config_path).expect("create blocking directory");
+
+    let auth = json!({ "OPENAI_API_KEY": "new-key" });
+    let config_text = r#"[mcp_servers.sample]
+type = "stdio"
+command = "noop"
+"#;
+
+    let err = cc_switch_lib::write_codex_live_atomic(&auth, Some(config_text))
+        .expect_err("config write should fail when target is directory");
+    match err {
+        cc_switch_lib::AppError::Io { path, .. } => {
+            assert!(
+                path.ends_with("config.toml"),
+                "io error path should point to config.toml"
+            );
+        }
+        cc_switch_lib::AppError::IoContext { context, .. } => {
+            assert!(
+                context.contains("config.toml"),
+                "error context should mention config path"
+            );
+        }
+        other => panic!("unexpected error variant: {other:?}"),
+    }
+
+    let stored = std::fs::read_to_string(&auth_path).expect("read existing auth");
+    assert!(
+        stored.contains("legacy"),
+        "auth.json should roll back to legacy content"
+    );
+    assert!(
+        std::fs::metadata(&config_path)
+            .expect("config path metadata")
+            .is_dir(),
+        "config path should remain a directory after failure"
+    );
+}
+
+#[test]
+fn import_from_codex_adds_servers_from_mcp_servers_table() {
+    let _guard = lock_test_mutex();
+    reset_test_fs();
+    let path = cc_switch_lib::get_codex_config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create codex dir");
+    }
+    fs::write(
+        &path,
+        r#"[mcp_servers.echo_server]
+type = "stdio"
+command = "echo"
+args = ["hello"]
+
+[mcp_servers.http_server]
+type = "http"
+url = "https://example.com"
+"#,
+    )
+    .expect("write codex config");
+
+    let mut config = MultiAppConfig::default();
+    let changed = cc_switch_lib::import_from_codex(&mut config).expect("import codex");
+    assert!(changed >= 2, "should import both servers");
+
+    // v3.7.0: 检查统一结构
+    let servers = config
+        .mcp
+        .servers
+        .as_ref()
+        .expect("unified servers should exist");
+
+    let echo = servers.get("echo_server").expect("echo server");
+    assert!(
+        echo.apps.codex,
+        "Codex app should be enabled for echo_server"
+    );
+    let server_spec = echo.server.as_object().expect("server spec");
+    assert_eq!(
+        server_spec
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+        "echo"
+    );
+
+    let http = servers.get("http_server").expect("http server");
+    assert!(
+        http.apps.codex,
+        "Codex app should be enabled for http_server"
+    );
+    let http_spec = http.server.as_object().expect("http spec");
+    assert_eq!(
+        http_spec.get("url").and_then(|v| v.as_str()).unwrap_or(""),
+        "https://example.com"
+    );
+}
+
+#[test]
+fn import_from_codex_infers_http_when_url_is_present_without_type() {
+    let _guard = lock_test_mutex();
+    reset_test_fs();
+    let path = cc_switch_lib::get_codex_config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create codex dir");
+    }
+    fs::write(
+        &path,
+        r#"[mcp_servers.cloudflare_api]
+url = "https://mcp.cloudflare.com/mcp"
+
+[mcp_servers.github]
+url = "https://api.githubcopilot.com/mcp/"
+bearer_token_env_var = "GITHUB_MCP_TOKEN"
+"#,
+    )
+    .expect("write codex config");
+
+    let mut config = MultiAppConfig::default();
+    let changed = cc_switch_lib::import_from_codex(&mut config).expect("import codex");
+    assert_eq!(changed, 2, "should import both URL-based servers");
+
+    let servers = config
+        .mcp
+        .servers
+        .as_ref()
+        .expect("unified servers should exist");
+
+    let cloudflare = servers
+        .get("cloudflare_api")
+        .expect("cloudflare server should be imported");
+    assert!(
+        cloudflare.apps.codex,
+        "Codex app should be enabled for cloudflare_api"
+    );
+    assert_eq!(cloudflare.server["type"], "http");
+    assert_eq!(cloudflare.server["url"], "https://mcp.cloudflare.com/mcp");
+
+    let github = servers
+        .get("github")
+        .expect("github server should be imported");
+    assert!(github.apps.codex, "Codex app should be enabled for github");
+    assert_eq!(github.server["type"], "http");
+    assert_eq!(github.server["url"], "https://api.githubcopilot.com/mcp/");
+    assert_eq!(
+        github.server["bearer_token_env_var"], "GITHUB_MCP_TOKEN",
+        "custom Codex HTTP fields should be preserved during import"
+    );
+}
+
+#[test]
+fn import_from_codex_does_not_infer_http_for_malformed_explicit_type() {
+    let _guard = lock_test_mutex();
+    reset_test_fs();
+    let path = cc_switch_lib::get_codex_config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create codex dir");
+    }
+    fs::write(
+        &path,
+        r#"[mcp_servers.invalid_type]
+type = 1
+url = "https://example.invalid/mcp"
+
+[mcp_servers.valid_remote]
+url = "https://example.com/mcp"
+"#,
+    )
+    .expect("write codex config");
+
+    let mut config = MultiAppConfig::default();
+    let changed = cc_switch_lib::import_from_codex(&mut config).expect("import codex");
+    assert_eq!(changed, 1, "only the URL-only entry should be imported");
+
+    let servers = config
+        .mcp
+        .servers
+        .as_ref()
+        .expect("unified servers should exist");
+
+    assert!(
+        !servers.contains_key("invalid_type"),
+        "malformed explicit type should not be silently inferred as http"
+    );
+
+    let valid_remote = servers
+        .get("valid_remote")
+        .expect("URL-only entry should still be imported");
+    assert_eq!(valid_remote.server["type"], "http");
+    assert_eq!(valid_remote.server["url"], "https://example.com/mcp");
+}
+
+#[test]
+fn import_from_codex_skips_unknown_type_without_stopping_later_entries() {
+    let _guard = lock_test_mutex();
+    reset_test_fs();
+    let path = cc_switch_lib::get_codex_config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create codex dir");
+    }
+    fs::write(
+        &path,
+        r#"[mcp_servers.aaa_unknown]
+type = "bogus"
+url = "https://example.invalid/ignored"
+
+[mcp_servers.zzz_echo]
+type = "stdio"
+command = "echo"
+args = ["ok"]
+"#,
+    )
+    .expect("write codex config");
+
+    let mut config = MultiAppConfig::default();
+    let changed = cc_switch_lib::import_from_codex(&mut config).expect("import codex");
+    assert_eq!(changed, 1, "invalid entries should not stop later imports");
+
+    let servers = config
+        .mcp
+        .servers
+        .as_ref()
+        .expect("unified servers should exist");
+
+    assert!(
+        !servers.contains_key("aaa_unknown"),
+        "unknown type entry should be skipped"
+    );
+
+    let echo_after = servers
+        .get("zzz_echo")
+        .expect("later valid entry should still be imported");
+    assert_eq!(echo_after.server["type"], "stdio");
+    assert_eq!(echo_after.server["command"], "echo");
+}
+
+#[test]
+fn mcp_env_import_from_codex_preserves_env_table() {
+    let _guard = lock_test_mutex();
+    reset_test_fs();
+    let path = cc_switch_lib::get_codex_config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create codex dir");
+    }
+    fs::write(
+        &path,
+        r#"[mcp_servers.echo_server]
+type = "stdio"
+command = "echo"
+
+[mcp_servers.echo_server.env]
+API_KEY = "secret"
+PROJECT_ROOT = ""
+"#,
+    )
+    .expect("write codex config");
+
+    let mut config = MultiAppConfig::default();
+    cc_switch_lib::import_from_codex(&mut config).expect("import codex");
+
+    let entry = config
+        .mcp
+        .servers
+        .as_ref()
+        .expect("unified servers should exist")
+        .get("echo_server")
+        .expect("echo server");
+    assert_eq!(entry.server["env"]["API_KEY"], "secret");
+    assert_eq!(entry.server["env"]["PROJECT_ROOT"], "");
+}
+
+#[test]
+fn import_from_codex_merges_into_existing_entries() {
+    let _guard = lock_test_mutex();
+    reset_test_fs();
+    let path = cc_switch_lib::get_codex_config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create codex dir");
+    }
+    fs::write(
+        &path,
+        r#"[mcp.servers.existing]
+type = "stdio"
+command = "echo"
+"#,
+    )
+    .expect("write codex config");
+
+    let mut config = MultiAppConfig::default();
+    // v3.7.0: 在统一结构中创建已存在的服务器
+    config.mcp.servers = Some(std::collections::HashMap::new());
+    config.mcp.servers.as_mut().unwrap().insert(
+        "existing".to_string(),
+        cc_switch_lib::McpServer {
+            id: "existing".to_string(),
+            name: "existing".to_string(),
+            server: json!({
+                "type": "stdio",
+                "command": "prev"
+            }),
+            apps: cc_switch_lib::McpApps {
+                claude: false,
+                codex: false, // 初始未启用
+                gemini: false,
+                opencode: false,
+                hermes: false,
+            },
+            description: None,
+            homepage: None,
+            docs: None,
+            tags: Vec::new(),
+        },
+    );
+
+    let changed = cc_switch_lib::import_from_codex(&mut config).expect("import codex");
+    assert!(changed >= 1, "should mark change for enabled flag");
+
+    // v3.7.0: 检查统一结构
+    let entry = config
+        .mcp
+        .servers
+        .as_ref()
+        .unwrap()
+        .get("existing")
+        .expect("existing entry");
+
+    // 验证 Codex 应用已启用
+    assert!(entry.apps.codex, "Codex app should be enabled after import");
+
+    // 验证现有配置被保留（server 不应被覆盖）
+    let spec = entry.server.as_object().expect("server spec");
+    assert_eq!(
+        spec.get("command").and_then(|v| v.as_str()),
+        Some("prev"),
+        "existing server config should be preserved, not overwritten by import"
+    );
+}
+
+#[test]
+fn sync_claude_enabled_mcp_projects_to_user_config() {
+    let _guard = lock_test_mutex();
+    reset_test_fs();
+
+    // Seed an empty .claude.json so should_sync_live detects Claude as initialized
+    let claude_path = cc_switch_lib::get_claude_mcp_path();
+    fs::write(&claude_path, "{}").expect("seed .claude.json");
+
+    let mut config = MultiAppConfig::default();
+
+    config.mcp.claude.servers.insert(
+        "stdio-enabled".into(),
+        json!({
+            "id": "stdio-enabled",
+            "enabled": true,
+            "server": {
+                "type": "stdio",
+                "command": "echo",
+                "args": ["hi"],
+            }
+        }),
+    );
+    config.mcp.claude.servers.insert(
+        "http-disabled".into(),
+        json!({
+            "id": "http-disabled",
+            "enabled": false,
+            "server": {
+                "type": "http",
+                "url": "https://example.com",
+            }
+        }),
+    );
+
+    cc_switch_lib::sync_enabled_to_claude(&config).expect("sync Claude MCP");
+
+    let claude_path = cc_switch_lib::get_claude_mcp_path();
+    assert!(claude_path.exists(), "claude config should exist");
+    let text = fs::read_to_string(&claude_path).expect("read .claude.json");
+    let value: serde_json::Value = serde_json::from_str(&text).expect("parse claude json");
+    let servers = value
+        .get("mcpServers")
+        .and_then(|v| v.as_object())
+        .expect("mcpServers map");
+    assert_eq!(servers.len(), 1, "only enabled entries should be written");
+    let enabled = servers.get("stdio-enabled").expect("enabled entry");
+    assert_eq!(
+        enabled
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default(),
+        "echo"
+    );
+    assert!(servers.get("http-disabled").is_none());
+}
+
+#[test]
+fn import_from_claude_merges_into_config() {
+    let _guard = lock_test_mutex();
+    reset_test_fs();
+    let home = ensure_test_home();
+    let claude_path = home.join(".claude.json");
+
+    fs::write(
+        &claude_path,
+        serde_json::to_string_pretty(&json!({
+            "mcpServers": {
+                "stdio-enabled": {
+                    "type": "stdio",
+                    "command": "echo",
+                    "args": ["hello"]
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .expect("write claude json");
+
+    let mut config = MultiAppConfig::default();
+    // v3.7.0: 在统一结构中创建已存在的服务器
+    config.mcp.servers = Some(std::collections::HashMap::new());
+    config.mcp.servers.as_mut().unwrap().insert(
+        "stdio-enabled".to_string(),
+        cc_switch_lib::McpServer {
+            id: "stdio-enabled".to_string(),
+            name: "stdio-enabled".to_string(),
+            server: json!({
+                "type": "stdio",
+                "command": "prev"
+            }),
+            apps: cc_switch_lib::McpApps {
+                claude: false, // 初始未启用
+                codex: false,
+                gemini: false,
+                opencode: false,
+                hermes: false,
+            },
+            description: None,
+            homepage: None,
+            docs: None,
+            tags: Vec::new(),
+        },
+    );
+
+    let changed = cc_switch_lib::import_from_claude(&mut config).expect("import from claude");
+    assert!(changed >= 1, "should mark at least one change");
+
+    // v3.7.0: 检查统一结构
+    let entry = config
+        .mcp
+        .servers
+        .as_ref()
+        .unwrap()
+        .get("stdio-enabled")
+        .expect("entry exists");
+
+    // 验证 Claude 应用已启用
+    assert!(
+        entry.apps.claude,
+        "Claude app should be enabled after import"
+    );
+
+    // 验证现有配置被保留（server 不应被覆盖）
+    let server = entry.server.as_object().expect("server obj");
+    assert_eq!(
+        server.get("command").and_then(|v| v.as_str()).unwrap_or(""),
+        "prev",
+        "existing server config should be preserved"
+    );
+}
+
+#[test]
+fn create_backup_skips_missing_file() {
+    let _guard = lock_test_mutex();
+    reset_test_fs();
+    let home = ensure_test_home();
+    let db_path = home.join(".cc-switch").join("cc-switch.db");
+
+    // 未创建数据库文件时应返回空字符串，不报错
+    let result = ConfigService::create_backup(&db_path, None).expect("create backup");
+    assert!(
+        result.is_empty(),
+        "expected empty backup id when database missing"
+    );
+}
+
+#[test]
+fn create_backup_generates_snapshot_file() {
+    let _guard = lock_test_mutex();
+    reset_test_fs();
+    let home = ensure_test_home();
+    let db_path = home.join(".cc-switch").join("cc-switch.db");
+
+    // Seed DB with at least one provider so the SQL dump contains data.
+    let mut config = MultiAppConfig::default();
+    {
+        let manager = config
+            .get_manager_mut(&AppType::Claude)
+            .expect("claude manager");
+        manager.current = "p1".to_string();
+        manager.providers.insert(
+            "p1".to_string(),
+            Provider::with_id(
+                "p1".to_string(),
+                "Test Claude".to_string(),
+                json!({
+                    "env": { "ANTHROPIC_AUTH_TOKEN": "test-key" }
+                }),
+                None,
+            ),
+        );
+    }
+    let state = state_from_config(config);
+    state.save().expect("persist db");
+
+    let backup_id = ConfigService::create_backup(&db_path, None).expect("backup success");
+    assert!(
+        !backup_id.is_empty(),
+        "backup id should contain timestamp information"
+    );
+
+    let backup_path = home
+        .join(".cc-switch")
+        .join("backups")
+        .join(format!("{backup_id}.sql"));
+    assert!(
+        backup_path.exists(),
+        "expected backup file at {}",
+        backup_path.display()
+    );
+
+    let backup_content = fs::read_to_string(&backup_path).expect("read backup");
+    assert!(
+        backup_content.starts_with("-- CC Switch SQLite 导出"),
+        "backup content should be a CC Switch SQL export"
+    );
+    assert!(
+        backup_content.contains("p1"),
+        "backup content should include seeded provider data"
+    );
+}
+
+#[test]
+fn create_backup_retains_only_latest_entries() {
+    let _guard = lock_test_mutex();
+    reset_test_fs();
+    let home = ensure_test_home();
+    let db_path = home.join(".cc-switch").join("cc-switch.db");
+
+    // Ensure DB exists so backups are created.
+    let state = state_from_config(MultiAppConfig::default());
+    state.save().expect("persist db");
+
+    let backups_dir = home.join(".cc-switch").join("backups");
+    fs::create_dir_all(&backups_dir).expect("create backups dir");
+    for idx in 0..12 {
+        let manual = backups_dir.join(format!("manual_{idx:02}.sql"));
+        fs::write(&manual, format!("-- manual backup {idx}\n")).expect("seed manual backup");
+    }
+
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    let latest_backup_id =
+        ConfigService::create_backup(&db_path, None).expect("create backup with cleanup");
+    assert!(
+        !latest_backup_id.is_empty(),
+        "backup id should not be empty when config exists"
+    );
+
+    let entries: Vec<_> = fs::read_dir(&backups_dir)
+        .expect("read backups dir")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "sql"))
+        .collect();
+    assert!(
+        entries.len() <= 10,
+        "expected backups to be trimmed to at most 10 files, got {}",
+        entries.len()
+    );
+
+    let latest_path = backups_dir.join(format!("{latest_backup_id}.sql"));
+    assert!(
+        latest_path.exists(),
+        "latest backup {} should be preserved",
+        latest_path.display()
+    );
+
+    // 进一步确认保留的条目包含一些历史文件，说明清理逻辑仅裁剪多余部分
+    let manual_kept = entries
+        .iter()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .any(|name| name.starts_with("manual_"));
+    assert!(
+        manual_kept,
+        "cleanup should keep part of the older backups to maintain history"
+    );
+}
+
+#[test]
+fn import_config_from_path_overwrites_state_and_creates_backup() {
+    let _guard = lock_test_mutex();
+    reset_test_fs();
+    let home = ensure_test_home();
+
+    // Seed current DB with a provider so pre-import backup is meaningful.
+    let mut config = MultiAppConfig::default();
+    {
+        let manager = config
+            .get_manager_mut(&AppType::Claude)
+            .expect("claude manager");
+        manager.current = "p-old".to_string();
+        manager.providers.insert(
+            "p-old".to_string(),
+            Provider::with_id(
+                "p-old".to_string(),
+                "Old Claude".to_string(),
+                json!({
+                    "env": { "ANTHROPIC_AUTH_TOKEN": "old-key" }
+                }),
+                None,
+            ),
+        );
+    }
+    let app_state = state_from_config(config);
+    app_state.save().expect("persist initial db");
+
+    // Build an import SQL file using an in-memory database.
+    let import_path = home.join(".cc-switch").join("import.sql");
+    let import_db = Database::memory().expect("create import db");
+    let provider = Provider::with_id(
+        "p-new".to_string(),
+        "Test Claude".to_string(),
+        json!({
+            "env": { "ANTHROPIC_AUTH_TOKEN": "new-key" }
+        }),
+        None,
+    );
+    import_db
+        .save_provider(AppType::Claude.as_str(), &provider)
+        .expect("seed provider");
+    import_db
+        .set_current_provider(AppType::Claude.as_str(), "p-new")
+        .expect("seed current");
+    import_db
+        .export_sql(&import_path)
+        .expect("export import sql");
+
+    let backup_id = ConfigService::import_config_from_path(&import_path, &app_state)
+        .expect("import should succeed");
+    assert!(
+        !backup_id.is_empty(),
+        "expected pre-import backup id when database exists"
+    );
+
+    let backup_path = home
+        .join(".cc-switch")
+        .join("backups")
+        .join(format!("{backup_id}.sql"));
+    assert!(
+        backup_path.exists(),
+        "backup file should exist at {}",
+        backup_path.display()
+    );
+
+    let current = app_state
+        .db
+        .get_current_provider(AppType::Claude.as_str())
+        .expect("read current provider from db");
+    assert_eq!(
+        current.as_deref(),
+        Some("p-new"),
+        "db should be replaced by imported SQL"
+    );
+
+    let cfg = app_state
+        .config
+        .read()
+        .expect("read refreshed config snapshot");
+    let manager = cfg.get_manager(&AppType::Claude).expect("claude manager");
+    assert_eq!(
+        manager.current, "p-new",
+        "import should refresh the in-memory config snapshot from the imported database"
+    );
+    assert!(
+        manager.providers.contains_key("p-new"),
+        "import should hydrate provider snapshots from the imported database"
+    );
+    assert!(
+        !manager.providers.contains_key("p-old"),
+        "import should drop providers that no longer exist in the imported database"
+    );
+}
+
+#[test]
+fn import_config_from_path_invalid_json_returns_error() {
+    let _guard = lock_test_mutex();
+    reset_test_fs();
+    let home = ensure_test_home();
+
+    let config_dir = home.join(".cc-switch");
+    fs::create_dir_all(&config_dir).expect("create config dir");
+
+    let invalid_path = config_dir.join("broken.sql");
+    fs::write(&invalid_path, "SELECT 1;").expect("write invalid sql");
+
+    let app_state = state_from_config(MultiAppConfig::default());
+
+    let err = ConfigService::import_config_from_path(&invalid_path, &app_state)
+        .expect_err("import should fail");
+    match err {
+        AppError::Localized { key, .. } => assert_eq!(key, "backup.sql.invalid_format"),
+        other => panic!("expected Localized invalid SQL error, got {other:?}"),
+    }
+}
+
+#[test]
+fn import_config_from_path_missing_file_produces_io_error() {
+    let _guard = lock_test_mutex();
+    reset_test_fs();
+    let _home = ensure_test_home();
+
+    let missing_path = Path::new("/nonexistent/import.sql");
+    let app_state = state_from_config(MultiAppConfig::default());
+
+    let err = ConfigService::import_config_from_path(missing_path, &app_state)
+        .expect_err("import should fail for missing file");
+    match err {
+        AppError::InvalidInput(_) => {}
+        other => panic!("expected invalid input error, got {other:?}"),
+    }
+}
+
+#[test]
+fn sync_gemini_packycode_sets_security_selected_type() {
+    let _guard = lock_test_mutex();
+    reset_test_fs();
+    let home = ensure_test_home();
+
+    let mut config = MultiAppConfig::default();
+    {
+        let manager = config
+            .get_manager_mut(&AppType::Gemini)
+            .expect("gemini manager");
+        manager.current = "packy-1".to_string();
+        manager.providers.insert(
+            "packy-1".to_string(),
+            Provider::with_id(
+                "packy-1".to_string(),
+                "PackyCode".to_string(),
+                json!({
+                    "env": {
+                        "GEMINI_API_KEY": "pk-key",
+                        "GOOGLE_GEMINI_BASE_URL": "https://api-slb.packyapi.com"
+                    }
+                }),
+                Some("https://www.packyapi.com".to_string()),
+            ),
+        );
+    }
+
+    ConfigService::sync_current_providers_to_live(&mut config)
+        .expect("syncing gemini live should succeed");
+
+    let settings_path = home.join(".cc-switch").join("settings.json");
+    assert!(
+        settings_path.exists(),
+        "settings.json should exist at {}",
+        settings_path.display()
+    );
+
+    let raw = std::fs::read_to_string(&settings_path).expect("read settings.json");
+    let value: serde_json::Value = serde_json::from_str(&raw).expect("parse settings.json");
+    assert_eq!(
+        value
+            .pointer("/security/auth/selectedType")
+            .and_then(|v| v.as_str()),
+        Some("gemini-api-key"),
+        "syncing PackyCode Gemini should enforce security.auth.selectedType"
+    );
+}
+
+#[test]
+fn sync_gemini_google_official_sets_oauth_security() {
+    let _guard = lock_test_mutex();
+    reset_test_fs();
+    let home = ensure_test_home();
+
+    let mut config = MultiAppConfig::default();
+    {
+        let manager = config
+            .get_manager_mut(&AppType::Gemini)
+            .expect("gemini manager");
+        manager.current = "google-official".to_string();
+        let mut provider = Provider::with_id(
+            "google-official".to_string(),
+            "Google".to_string(),
+            json!({
+                "env": {}
+            }),
+            Some("https://ai.google.dev".to_string()),
+        );
+        provider.meta = Some(ProviderMeta {
+            partner_promotion_key: Some("google-official".to_string()),
+            ..ProviderMeta::default()
+        });
+        manager
+            .providers
+            .insert("google-official".to_string(), provider);
+    }
+
+    ConfigService::sync_current_providers_to_live(&mut config)
+        .expect("syncing google official gemini should succeed");
+
+    let cc_settings = home.join(".cc-switch").join("settings.json");
+    assert!(
+        cc_settings.exists(),
+        "app settings should exist at {}",
+        cc_settings.display()
+    );
+    let cc_raw = std::fs::read_to_string(&cc_settings).expect("read .cc-switch settings");
+    let cc_value: serde_json::Value = serde_json::from_str(&cc_raw).expect("parse app settings");
+    assert_eq!(
+        cc_value
+            .pointer("/security/auth/selectedType")
+            .and_then(|v| v.as_str()),
+        Some("oauth-personal"),
+        "syncing Google official should set oauth-personal in app settings"
+    );
+
+    let gemini_settings = home.join(".gemini").join("settings.json");
+    assert!(
+        gemini_settings.exists(),
+        "Gemini settings should exist at {}",
+        gemini_settings.display()
+    );
+    let gemini_raw = std::fs::read_to_string(&gemini_settings).expect("read gemini settings");
+    let gemini_value: serde_json::Value =
+        serde_json::from_str(&gemini_raw).expect("parse gemini settings json");
+    assert_eq!(
+        gemini_value
+            .pointer("/security/auth/selectedType")
+            .and_then(|v| v.as_str()),
+        Some("oauth-personal"),
+        "Gemini settings should also record oauth-personal"
+    );
+}
+
+#[test]
+fn import_openclaw_live_config_preserves_unrelated_root_sections_and_source_text() {
+    let _guard = lock_test_mutex();
+    reset_test_fs();
+    let home = ensure_test_home();
+
+    let openclaw_dir = home.join(".openclaw");
+    fs::create_dir_all(&openclaw_dir).expect("create openclaw dir");
+    let openclaw_path = openclaw_dir.join("openclaw.json");
+    let source = r#"// preserve-me
+{
+  models: {
+    mode: 'merge',
+    providers: {
+      openai: {
+        name: 'OpenAI Compatible',
+        apiKey: 'sk-openai',
+        baseUrl: 'https://api.example.com/v1',
+        models: [
+          {
+            id: 'gpt-4.1',
+            name: 'OpenAI Compatible',
+          },
+        ],
+      },
+    },
+  },
+  agents: {
+    defaults: {
+      model: {
+        primary: 'openai/gpt-4.1',
+      },
+    },
+  },
+  tools: {
+    profile: 'coding',
+  },
+}
+"#;
+    fs::write(&openclaw_path, source).expect("seed openclaw json5 config");
+
+    let state = state_from_config(MultiAppConfig::default());
+
+    ProviderService::import_openclaw_providers_from_live(&state)
+        .expect("import openclaw live config should succeed");
+
+    let after = fs::read_to_string(&openclaw_path).expect("read openclaw file after import");
+    assert_eq!(
+        after, source,
+        "import should not rewrite unrelated OpenClaw document sections or formatting"
+    );
+
+    let guard = state.config.read().expect("read config after import");
+    let manager = guard
+        .get_manager(&AppType::OpenClaw)
+        .expect("openclaw manager after import");
+    assert!(manager.providers.contains_key("openai"));
+}
+
+#[test]
+fn import_openclaw_live_config_skips_modeless_default_provider_without_rewriting_source_text() {
+    let _guard = lock_test_mutex();
+    reset_test_fs();
+    let home = ensure_test_home();
+
+    let openclaw_dir = home.join(".openclaw");
+    fs::create_dir_all(&openclaw_dir).expect("create openclaw dir");
+    let openclaw_path = openclaw_dir.join("openclaw.json");
+    let source = r#"// preserve-me-too
+{
+  models: {
+    mode: 'merge',
+    providers: {
+      empty: {
+        apiKey: 'sk-empty',
+        baseUrl: 'https://empty.example.com/v1',
+        models: [],
+      },
+      openai: {
+        apiKey: 'sk-openai',
+        baseUrl: 'https://api.example.com/v1',
+        models: [
+          {
+            id: 'gpt-4.1',
+            name: 'OpenAI Compatible',
+          },
+        ],
+      },
+    },
+  },
+  agents: {
+    defaults: {
+      model: {
+        primary: 'empty/gpt-4.1',
+        fallbacks: ['openai/gpt-4.1'],
+      },
+    },
+  },
+  tools: {
+    profile: 'coding',
+  },
+}
+"#;
+    fs::write(&openclaw_path, source).expect("seed openclaw json5 config");
+
+    let state = state_from_config(MultiAppConfig::default());
+
+    ProviderService::import_openclaw_providers_from_live(&state)
+        .expect("import openclaw live config should succeed");
+
+    let after = fs::read_to_string(&openclaw_path).expect("read openclaw file after import");
+    assert_eq!(
+        after, source,
+        "import should not rewrite the OpenClaw source document while skipping modeless providers"
+    );
+
+    let guard = state.config.read().expect("read config after import");
+    let manager = guard
+        .get_manager(&AppType::OpenClaw)
+        .expect("openclaw manager after import");
+    assert!(!manager.providers.contains_key("empty"));
+    assert!(manager.providers.contains_key("openai"));
+    assert_eq!(manager.providers.len(), 1);
+}
+
+#[test]
+fn export_config_to_file_writes_target_path() {
+    let _guard = lock_test_mutex();
+    reset_test_fs();
+    let home = ensure_test_home();
+
+    // Seed DB with data so export includes at least one known id.
+    let mut config = MultiAppConfig::default();
+    {
+        let manager = config
+            .get_manager_mut(&AppType::Claude)
+            .expect("claude manager");
+        manager.current = "p1".to_string();
+        manager.providers.insert(
+            "p1".to_string(),
+            Provider::with_id(
+                "p1".to_string(),
+                "Test Claude".to_string(),
+                json!({
+                    "env": { "ANTHROPIC_AUTH_TOKEN": "test-key" }
+                }),
+                None,
+            ),
+        );
+    }
+    let state = state_from_config(config);
+    state.save().expect("persist db");
+
+    let export_path = home.join("exported-config.sql");
+    if export_path.exists() {
+        fs::remove_file(&export_path).expect("cleanup export target");
+    }
+
+    let result = block_on(cc_switch_lib::export_config_to_file(
+        export_path.to_string_lossy().to_string(),
+    ))
+    .expect("export should succeed");
+    assert_eq!(result.get("success").and_then(|v| v.as_bool()), Some(true));
+
+    let exported = fs::read_to_string(&export_path).expect("read exported file");
+    assert!(
+        exported.starts_with("-- CC Switch SQLite 导出"),
+        "exported file should be a CC Switch SQL export"
+    );
+    assert!(
+        exported.contains("p1"),
+        "exported SQL should contain seeded provider data"
+    );
+}
+
+#[test]
+fn export_config_to_file_returns_error_when_path_invalid() {
+    let _guard = lock_test_mutex();
+    reset_test_fs();
+
+    let err = block_on(cc_switch_lib::export_config_to_file(String::new()))
+        .expect_err("export should fail");
+    assert!(
+        err.contains("Invalid export path"),
+        "expected invalid export path message, got {err}"
+    );
+}

@@ -1,0 +1,557 @@
+use super::codex_config::parse_codex_config_snippet;
+use super::provider_state::codex_model_catalog_row_from_value;
+use super::{
+    claude_disable_auto_upgrade_enabled, claude_effort_max_enabled,
+    claude_hide_attribution_enabled, claude_teammates_enabled, claude_tool_search_enabled,
+    detect_balance_provider_for_usage_query, detect_coding_plan_provider_for_usage_query,
+    normalize_local_proxy_header_overrides, ClaudeApiFormat, ClaudeModelRole, CodexWireApi,
+    PromptCacheRoutingMode, ProviderAddFormState, UsageQueryTemplate,
+    OPENCLAW_DEFAULT_API_PROTOCOL,
+};
+use crate::app_config::AppType;
+use crate::claude_model_config::{
+    CLAUDE_DEFAULT_MODEL_ENV_KEY, CLAUDE_LEGACY_SMALL_FAST_MODEL_ENV_KEY,
+    CLAUDE_SUBAGENT_MODEL_ENV_KEY,
+};
+use crate::provider::Provider;
+use serde_json::Value;
+
+pub(super) fn populate_form_from_provider(
+    form: &mut ProviderAddFormState,
+    app_type: &AppType,
+    provider: &Provider,
+) {
+    match app_type {
+        AppType::Claude => populate_claude_form(form, provider),
+        AppType::Codex => populate_codex_form(form, provider),
+        AppType::Gemini => populate_gemini_form(form, provider),
+        AppType::OpenCode => populate_opencode_form(form, provider),
+        AppType::Hermes => populate_hermes_form(form, provider),
+        AppType::OpenClaw => populate_openclaw_form(form, provider),
+    }
+    form.is_full_url = form.supports_full_url_mode()
+        && provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.is_full_url)
+            .unwrap_or(false);
+    populate_local_proxy_settings_form(form, provider);
+    populate_usage_query_form(form, provider);
+}
+
+fn populate_local_proxy_settings_form(form: &mut ProviderAddFormState, provider: &Provider) {
+    let Some(meta) = provider.meta.as_ref() else {
+        return;
+    };
+
+    if let Some(user_agent) = meta.custom_user_agent.as_deref() {
+        form.custom_user_agent.set(user_agent);
+    }
+    if let Some(overrides) = meta.local_proxy_request_overrides.as_ref() {
+        let original_headers = overrides
+            .headers
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        form.local_proxy_header_overrides = normalize_local_proxy_header_overrides(
+            overrides
+                .headers
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone())),
+        )
+        .unwrap_or(original_headers);
+        form.local_proxy_body_override = overrides.body.clone();
+    }
+}
+
+fn populate_usage_query_form(form: &mut ProviderAddFormState, provider: &Provider) {
+    form.usage_query_official_subscription = provider
+        .official_subscription_tool(&form.app_type)
+        .is_some();
+
+    let Some(script) = provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.usage_script.as_ref())
+    else {
+        form.refresh_default_usage_query_template();
+        return;
+    };
+
+    if form.usage_query_official_subscription
+        && script.template_type.as_deref()
+            != Some(UsageQueryTemplate::OfficialSubscription.as_str())
+    {
+        // The desktop UI resets incompatible saved templates when an official
+        // Claude/Codex/Gemini provider opens its Usage Query editor.
+        form.usage_query_enabled = false;
+        form.usage_query_template = UsageQueryTemplate::OfficialSubscription;
+        form.usage_query_timeout.set("10");
+        form.usage_query_auto_interval.set("5");
+        form.usage_query_code.clear();
+        return;
+    }
+
+    form.usage_query_enabled = script.enabled;
+    form.usage_query_timeout
+        .set(script.timeout.unwrap_or(10).to_string());
+    form.usage_query_auto_interval
+        .set(script.auto_query_interval.unwrap_or(5).to_string());
+    if let Some(value) = script.api_key.as_deref() {
+        form.usage_query_api_key.set(value);
+    }
+    if let Some(value) = script.base_url.as_deref() {
+        form.usage_query_base_url.set(value);
+    }
+    if let Some(value) = script.access_token.as_deref() {
+        form.usage_query_access_token.set(value);
+    }
+    if let Some(value) = script.user_id.as_deref() {
+        form.usage_query_user_id.set(value);
+    }
+    if let Some(value) = script.coding_plan_provider.as_deref() {
+        form.usage_query_coding_plan_provider.set(value);
+    } else if let Some(provider) =
+        detect_coding_plan_provider_for_usage_query(&form.current_provider_base_url())
+    {
+        form.usage_query_coding_plan_provider.set(provider);
+    }
+
+    let template = script
+        .template_type
+        .as_deref()
+        .and_then(UsageQueryTemplate::from_str)
+        .or_else(|| {
+            if script.access_token.is_some() || script.user_id.is_some() {
+                Some(UsageQueryTemplate::NewApi)
+            } else if script.api_key.is_some() || script.base_url.is_some() {
+                Some(UsageQueryTemplate::General)
+            } else if detect_balance_provider_for_usage_query(&form.current_provider_base_url()) {
+                Some(UsageQueryTemplate::Balance)
+            } else {
+                Some(UsageQueryTemplate::General)
+            }
+        })
+        .unwrap_or(UsageQueryTemplate::General);
+
+    form.usage_query_template = template;
+    form.usage_query_code = script.code.clone();
+}
+
+fn populate_claude_form(form: &mut ProviderAddFormState, provider: &Provider) {
+    form.claude_api_format = parse_claude_api_format(provider);
+    form.claude_api_key_field = crate::provider::ClaudeApiKeyField::from_meta_and_settings(
+        provider.meta.as_ref(),
+        &provider.settings_config,
+    );
+    form.claude_hide_attribution = claude_hide_attribution_enabled(&provider.settings_config);
+    form.claude_teammates = claude_teammates_enabled(&provider.settings_config);
+    form.claude_tool_search = claude_tool_search_enabled(&provider.settings_config);
+    form.claude_effort_max = claude_effort_max_enabled(&provider.settings_config);
+    form.claude_disable_auto_upgrade =
+        claude_disable_auto_upgrade_enabled(&provider.settings_config);
+    if provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.provider_type.as_deref())
+        == Some("codex_oauth")
+    {
+        form.claude_api_format = ClaudeApiFormat::OpenAiResponses;
+        form.codex_oauth_account_id = provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.managed_account_id_for("codex_oauth"));
+        form.codex_fast_mode = provider
+            .meta
+            .as_ref()
+            .map(|meta| meta.codex_fast_mode_enabled())
+            .unwrap_or(false);
+    }
+    if let Some(env) = provider
+        .settings_config
+        .get("env")
+        .and_then(|value| value.as_object())
+    {
+        if let Some(token) = env
+            .get(form.claude_api_key_field.as_env_key())
+            .and_then(|value| value.as_str())
+            .or_else(|| {
+                env.get(form.claude_api_key_field.alternate_env_key())
+                    .and_then(|value| value.as_str())
+            })
+        {
+            form.claude_api_key.set(token);
+        }
+        if let Some(url) = env
+            .get("ANTHROPIC_BASE_URL")
+            .and_then(|value| value.as_str())
+        {
+            form.claude_base_url.set(url);
+        }
+        if let Some(model) = env
+            .get(CLAUDE_DEFAULT_MODEL_ENV_KEY)
+            .and_then(|value| value.as_str())
+        {
+            form.claude_model.set(model);
+        }
+        let model = env
+            .get(CLAUDE_DEFAULT_MODEL_ENV_KEY)
+            .and_then(|value| value.as_str());
+        let small_fast = env
+            .get(CLAUDE_LEGACY_SMALL_FAST_MODEL_ENV_KEY)
+            .and_then(|value| value.as_str());
+        let role_model = |role: ClaudeModelRole| {
+            env.get(role.model_env_key())
+                .and_then(|value| value.as_str())
+        };
+
+        if let Some(haiku) = role_model(ClaudeModelRole::Haiku).or(small_fast).or(model) {
+            form.set_claude_model_from_config(ClaudeModelRole::Haiku.index(), haiku);
+        }
+        if let Some(sonnet) = role_model(ClaudeModelRole::Sonnet).or(model).or(small_fast) {
+            form.set_claude_model_from_config(ClaudeModelRole::Sonnet.index(), sonnet);
+        }
+        let opus = role_model(ClaudeModelRole::Opus).or(model).or(small_fast);
+        if let Some(opus) = opus {
+            form.set_claude_model_from_config(ClaudeModelRole::Opus.index(), opus);
+        }
+        if let Some(fable) = role_model(ClaudeModelRole::Fable).or(opus) {
+            form.set_claude_model_from_config(ClaudeModelRole::Fable.index(), fable);
+        }
+        if let Some(subagent) = env
+            .get(CLAUDE_SUBAGENT_MODEL_ENV_KEY)
+            .and_then(|value| value.as_str())
+        {
+            form.set_claude_model_from_config(ClaudeModelRole::Subagent.index(), subagent);
+        }
+    }
+}
+
+fn populate_codex_form(form: &mut ProviderAddFormState, provider: &Provider) {
+    if let Some(config) = provider
+        .settings_config
+        .get("config")
+        .and_then(|value| value.as_str())
+    {
+        let parsed = parse_codex_config_snippet(config);
+        if let Some(base_url) = parsed.base_url {
+            form.codex_base_url.set(base_url);
+        }
+        if let Some(model) = parsed.model {
+            form.codex_model.set(model);
+        }
+        if let Some(requires_openai_auth) = parsed.requires_openai_auth {
+            form.codex_requires_openai_auth = requires_openai_auth;
+        }
+        if let Some(env_key) = parsed.env_key {
+            form.codex_env_key.set(env_key);
+        }
+        form.codex_goal_mode = crate::codex_config::is_codex_goal_mode_enabled(config);
+        form.codex_remote_compaction =
+            crate::codex_config::is_codex_remote_compaction_enabled(config);
+    }
+    if let Some(auth) = provider
+        .settings_config
+        .get("auth")
+        .and_then(|value| value.as_object())
+    {
+        if let Some(key) = auth.get("OPENAI_API_KEY").and_then(|value| value.as_str()) {
+            form.codex_api_key.set(key);
+        }
+    }
+    form.claude_api_format = parse_codex_api_format(provider);
+    form.claude_api_key_field = provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.api_key_field.as_deref())
+        .filter(|field| *field == "ANTHROPIC_API_KEY")
+        .map(|_| crate::provider::ClaudeApiKeyField::ApiKey)
+        .unwrap_or(crate::provider::ClaudeApiKeyField::AuthToken);
+    form.codex_impersonate_claude_code = provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.impersonate_claude_code)
+        == Some(true);
+    if let Some(max_output_tokens) = provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.max_output_tokens)
+        .filter(|value| *value > 0)
+    {
+        form.codex_max_output_tokens
+            .set(max_output_tokens.to_string());
+    }
+    form.codex_wire_api = CodexWireApi::Responses;
+    form.codex_chat_reasoning = provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.codex_chat_reasoning.clone())
+        .unwrap_or_default();
+    form.codex_prompt_cache_routing = provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.prompt_cache_routing.as_deref())
+        .map(PromptCacheRoutingMode::from_raw)
+        .unwrap_or(PromptCacheRoutingMode::Auto);
+    form.codex_model_catalog = provider
+        .settings_config
+        .get("modelCatalog")
+        .and_then(|catalog| catalog.get("models"))
+        .and_then(Value::as_array)
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(codex_model_catalog_row_from_value)
+                .collect()
+        })
+        .unwrap_or_default();
+    // The routing/mapping toggle has no dedicated stored field: a provider that
+    // already carries a catalog is treated as having local routing enabled.
+    form.codex_local_routing_enabled = !form.codex_model_catalog.is_empty();
+}
+
+fn populate_gemini_form(form: &mut ProviderAddFormState, provider: &Provider) {
+    // The upstream model is an add-form default only. Existing providers that
+    // intentionally omit GEMINI_MODEL must remain unset when edited or copied.
+    form.gemini_model.set("");
+
+    if let Some(env) = provider
+        .settings_config
+        .get("env")
+        .and_then(|value| value.as_object())
+    {
+        if let Some(key) = env.get("GEMINI_API_KEY").and_then(|value| value.as_str()) {
+            form.gemini_auth_type = super::GeminiAuthType::ApiKey;
+            form.gemini_api_key.set(key);
+        } else {
+            form.gemini_auth_type = super::GeminiAuthType::OAuth;
+        }
+
+        if let Some(url) = env
+            .get("GOOGLE_GEMINI_BASE_URL")
+            .or_else(|| env.get("GEMINI_BASE_URL"))
+            .and_then(|value| value.as_str())
+        {
+            form.gemini_base_url.set(url);
+        }
+
+        if let Some(model) = env.get("GEMINI_MODEL").and_then(|value| value.as_str()) {
+            form.gemini_model.set(model);
+        }
+    } else {
+        form.gemini_auth_type = super::GeminiAuthType::OAuth;
+    }
+}
+
+fn populate_opencode_form(form: &mut ProviderAddFormState, provider: &Provider) {
+    if let Some(npm) = provider
+        .settings_config
+        .get("npm")
+        .and_then(|value| value.as_str())
+    {
+        form.opencode_npm_package.set(npm);
+    }
+    if let Some(options) = provider
+        .settings_config
+        .get("options")
+        .and_then(|value| value.as_object())
+    {
+        if let Some(api_key) = options.get("apiKey").and_then(|value| value.as_str()) {
+            form.opencode_api_key.set(api_key);
+        }
+        if let Some(base_url) = options.get("baseURL").and_then(|value| value.as_str()) {
+            form.opencode_base_url.set(base_url);
+        }
+    }
+    if let Some(models) = provider
+        .settings_config
+        .get("models")
+        .and_then(|value| value.as_object())
+    {
+        if let Some((model_id, model_value)) =
+            models.iter().max_by(|(id_a, model_a), (id_b, model_b)| {
+                opencode_model_rank(model_a)
+                    .cmp(&opencode_model_rank(model_b))
+                    .then_with(|| id_b.cmp(id_a))
+            })
+        {
+            form.opencode_model_original_id = Some(model_id.clone());
+            form.opencode_model_id.set(model_id);
+            if let Some(name) = model_value.get("name").and_then(|value| value.as_str()) {
+                form.opencode_model_name.set(name);
+            } else {
+                form.opencode_model_name.set(model_id);
+            }
+            if let Some(limit) = model_value.get("limit").and_then(|value| value.as_object()) {
+                if let Some(context) = limit.get("context").and_then(|value| value.as_u64()) {
+                    form.opencode_model_context_limit.set(context.to_string());
+                }
+                if let Some(output) = limit.get("output").and_then(|value| value.as_u64()) {
+                    form.opencode_model_output_limit.set(output.to_string());
+                }
+            }
+        }
+    }
+}
+
+fn populate_hermes_form(form: &mut ProviderAddFormState, provider: &Provider) {
+    let settings = &provider.settings_config;
+
+    if let Some(api_mode) = settings
+        .get("api_mode")
+        .or_else(|| settings.get("apiMode"))
+        .and_then(|value| value.as_str())
+    {
+        if super::HERMES_API_MODES.contains(&api_mode) {
+            form.hermes_api_mode = api_mode.to_string();
+        }
+    }
+
+    if let Some(base_url) = settings
+        .get("base_url")
+        .or_else(|| settings.get("baseUrl"))
+        .or_else(|| settings.get("baseURL"))
+        .or_else(|| settings.get("endpoint"))
+        .and_then(|value| value.as_str())
+    {
+        form.hermes_base_url.set(base_url);
+    }
+    if let Some(api_key) = settings
+        .get("api_key")
+        .or_else(|| settings.get("apiKey"))
+        .or_else(|| settings.get("auth_token"))
+        .and_then(|value| value.as_str())
+    {
+        form.hermes_api_key.set(api_key);
+    }
+    if let Some(models) = settings.get("models").and_then(|value| value.as_array()) {
+        form.hermes_models = models.clone();
+    }
+    if let Some(delay) = settings
+        .get("rate_limit_delay")
+        .and_then(|value| value.as_f64())
+    {
+        if delay.is_finite() && delay >= 0.0 {
+            form.hermes_rate_limit_delay.set(delay.to_string());
+        }
+    }
+}
+
+fn populate_openclaw_form(form: &mut ProviderAddFormState, provider: &Provider) {
+    if let Some(api_key) = provider
+        .settings_config
+        .get("apiKey")
+        .and_then(|value| value.as_str())
+    {
+        form.opencode_api_key.set(api_key);
+    }
+    if let Some(base_url) = provider
+        .settings_config
+        .get("baseUrl")
+        .and_then(|value| value.as_str())
+    {
+        form.opencode_base_url.set(base_url);
+    }
+    if let Some(api) = provider
+        .settings_config
+        .get("api")
+        .and_then(|value| value.as_str())
+    {
+        form.opencode_npm_package.set(api);
+    } else {
+        form.opencode_npm_package.set(OPENCLAW_DEFAULT_API_PROTOCOL);
+    }
+    if provider
+        .settings_config
+        .get("headers")
+        .and_then(|value| value.as_object())
+        .is_some_and(|headers| headers.contains_key("User-Agent"))
+    {
+        form.openclaw_user_agent = true;
+    }
+    if let Some(models) = provider
+        .settings_config
+        .get("models")
+        .and_then(|value| value.as_array())
+    {
+        form.openclaw_models = models.clone();
+    }
+    if let Some(model) = form.openclaw_models.first() {
+        if let Some(id) = model.get("id").and_then(|value| value.as_str()) {
+            form.opencode_model_original_id = Some(id.to_string());
+            form.opencode_model_id.set(id);
+        }
+        if let Some(name) = model.get("name").and_then(|value| value.as_str()) {
+            form.opencode_model_name.set(name);
+        }
+        if let Some(context_window) = model.get("contextWindow").and_then(|value| value.as_u64()) {
+            form.opencode_model_context_limit
+                .set(context_window.to_string());
+        }
+    }
+}
+
+fn parse_claude_api_format(provider: &Provider) -> ClaudeApiFormat {
+    if let Some(api_format) = provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.api_format.as_deref())
+    {
+        return ClaudeApiFormat::from_raw(api_format);
+    }
+
+    if let Some(api_format) = provider
+        .settings_config
+        .get("api_format")
+        .and_then(|value| value.as_str())
+    {
+        return ClaudeApiFormat::from_raw(api_format);
+    }
+
+    let compat_enabled = match provider.settings_config.get("openrouter_compat_mode") {
+        Some(Value::Bool(value)) => *value,
+        Some(Value::Number(value)) => value.as_i64().unwrap_or(0) != 0,
+        Some(Value::String(value)) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            normalized == "true" || normalized == "1"
+        }
+        _ => false,
+    };
+
+    if compat_enabled {
+        ClaudeApiFormat::OpenAiChat
+    } else {
+        ClaudeApiFormat::Anthropic
+    }
+}
+
+fn parse_codex_api_format(provider: &Provider) -> ClaudeApiFormat {
+    if crate::proxy::providers::codex_provider_uses_anthropic(provider) {
+        return ClaudeApiFormat::Anthropic;
+    }
+    if crate::proxy::providers::codex_provider_uses_chat_completions(provider) {
+        return ClaudeApiFormat::OpenAiChat;
+    }
+    ClaudeApiFormat::OpenAiResponses
+}
+
+fn opencode_model_rank(model: &Value) -> usize {
+    let mut score = 0;
+    if model
+        .get("limit")
+        .and_then(|value| value.as_object())
+        .map(|limit| !limit.is_empty())
+        .unwrap_or(false)
+    {
+        score += 1;
+    }
+    if model
+        .get("options")
+        .and_then(|value| value.as_object())
+        .map(|options| !options.is_empty())
+        .unwrap_or(false)
+    {
+        score += 1;
+    }
+    score
+}

@@ -1,0 +1,1841 @@
+use super::*;
+
+use std::{collections::HashMap, path::Path};
+
+use chrono::{Local, TimeZone};
+use serde_json::Value;
+
+pub(crate) enum OpenClawDailyMemoryListItem<'a> {
+    File(&'a crate::commands::workspace::DailyMemoryFileInfo),
+    Search(&'a crate::commands::workspace::DailyMemorySearchResult),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenClawWorkspaceRow {
+    File(&'static str),
+    DailyMemory,
+}
+
+impl OpenClawWorkspaceRow {
+    pub(crate) fn all() -> Vec<Self> {
+        crate::commands::workspace::ALLOWED_FILES
+            .iter()
+            .copied()
+            .map(Self::File)
+            .chain(std::iter::once(Self::DailyMemory))
+            .collect()
+    }
+
+    pub(crate) fn from_index(index: usize) -> Option<Self> {
+        crate::commands::workspace::ALLOWED_FILES
+            .get(index)
+            .copied()
+            .map(Self::File)
+            .or_else(|| {
+                (index == crate::commands::workspace::ALLOWED_FILES.len())
+                    .then_some(Self::DailyMemory)
+            })
+    }
+}
+
+pub(crate) const OPENCLAW_TOOLS_PROFILE_PICKER_VALUES: [Option<&str>; 5] = [
+    None,
+    Some("minimal"),
+    Some("coding"),
+    Some("messaging"),
+    Some("full"),
+];
+pub(crate) const OPENCLAW_TOOLS_PROFILE_PICKER_LEN: usize =
+    OPENCLAW_TOOLS_PROFILE_PICKER_VALUES.len();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenClawToolsSection {
+    Profile,
+    Allow,
+    Deny,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OpenClawModelOption {
+    pub value: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenClawAgentsSection {
+    PrimaryModel,
+    FallbackModels,
+    Runtime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenClawAgentsRuntimeField {
+    Workspace,
+    Timeout,
+    ContextTokens,
+    MaxConcurrent,
+}
+
+impl OpenClawAgentsRuntimeField {
+    pub(crate) fn from_row(row: usize) -> Option<Self> {
+        match row {
+            0 => Some(Self::Workspace),
+            1 => Some(Self::Timeout),
+            2 => Some(Self::ContextTokens),
+            3 => Some(Self::MaxConcurrent),
+            _ => None,
+        }
+    }
+}
+
+pub(crate) const OPENCLAW_AGENTS_MODEL_PICKER_NONE: usize = usize::MAX;
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct OpenClawAgentsFormState {
+    pub primary_model: String,
+    pub fallbacks: Vec<String>,
+    pub workspace: String,
+    pub timeout: String,
+    pub timeout_seconds_seed: Option<Value>,
+    pub context_tokens: String,
+    pub context_tokens_seed: Option<Value>,
+    pub max_concurrent: String,
+    pub max_concurrent_seed: Option<Value>,
+    pub model_catalog: Option<
+        std::collections::HashMap<String, crate::openclaw_config::OpenClawModelCatalogEntry>,
+    >,
+    pub defaults_extra: HashMap<String, Value>,
+    pub model_extra: HashMap<String, Value>,
+    pub has_legacy_timeout: bool,
+    pub section: OpenClawAgentsSection,
+    pub row: usize,
+}
+
+impl OpenClawAgentsFormState {
+    pub(crate) fn from_snapshot(
+        defaults: Option<&crate::openclaw_config::OpenClawAgentsDefaults>,
+    ) -> Self {
+        let form = crate::cli::openclaw_form_normalization::OpenClawAgentsFormLike::from_snapshot(
+            defaults,
+        );
+
+        Self {
+            primary_model: form.primary_model,
+            fallbacks: form.fallbacks,
+            workspace: form.workspace,
+            timeout: form.timeout,
+            timeout_seconds_seed: form.timeout_seconds_seed,
+            context_tokens: form.context_tokens,
+            context_tokens_seed: form.context_tokens_seed,
+            max_concurrent: form.max_concurrent,
+            max_concurrent_seed: form.max_concurrent_seed,
+            model_catalog: form.model_catalog,
+            defaults_extra: form.defaults_extra,
+            model_extra: form.model_extra,
+            has_legacy_timeout: form.has_legacy_timeout,
+            section: OpenClawAgentsSection::PrimaryModel,
+            row: 0,
+        }
+    }
+
+    pub(crate) fn move_down(&mut self) {
+        self.section = self.clamp_section(self.section);
+        let rows = self.rows_in_section(self.section);
+        if self.row + 1 < rows {
+            self.row += 1;
+            return;
+        }
+
+        match self.section {
+            OpenClawAgentsSection::PrimaryModel => {
+                self.section = OpenClawAgentsSection::FallbackModels;
+                self.row = 0;
+            }
+            OpenClawAgentsSection::FallbackModels => {
+                self.section = OpenClawAgentsSection::Runtime;
+                self.row = 0;
+            }
+            OpenClawAgentsSection::Runtime => {
+                self.section = OpenClawAgentsSection::Runtime;
+                self.row = self.rows_in_section(self.section).saturating_sub(1);
+            }
+        }
+    }
+
+    pub(crate) fn move_up(&mut self) {
+        self.section = self.clamp_section(self.section);
+        if self.row > 0 {
+            self.row -= 1;
+            return;
+        }
+
+        self.section = match self.section {
+            OpenClawAgentsSection::PrimaryModel => OpenClawAgentsSection::PrimaryModel,
+            OpenClawAgentsSection::FallbackModels => OpenClawAgentsSection::PrimaryModel,
+            OpenClawAgentsSection::Runtime => OpenClawAgentsSection::FallbackModels,
+        };
+        self.row = self.rows_in_section(self.section).saturating_sub(1);
+    }
+
+    pub(crate) fn restore_position(&mut self, previous: &Self) {
+        self.section = self.clamp_section(previous.section);
+        self.row = previous
+            .row
+            .min(self.rows_in_section(self.section).saturating_sub(1));
+    }
+
+    pub(crate) fn primary_model_picker_selection(&self, options: &[OpenClawModelOption]) -> usize {
+        model_picker_selection(&self.primary_model, options)
+    }
+
+    pub(crate) fn insert_fallback(&mut self, value: String) {
+        let index = self.row.min(self.fallbacks.len());
+        self.fallbacks.insert(index, value);
+        self.row = index;
+    }
+
+    pub(crate) fn clear_primary_model(&mut self) {
+        self.primary_model.clear();
+    }
+
+    pub(crate) fn available_fallback_options(
+        &self,
+        options: &[OpenClawModelOption],
+    ) -> Vec<OpenClawModelOption> {
+        let used = self
+            .fallbacks
+            .iter()
+            .filter(|value| !value.trim().is_empty())
+            .cloned()
+            .chain((!self.primary_model.trim().is_empty()).then(|| self.primary_model.clone()))
+            .collect::<std::collections::HashSet<_>>();
+
+        options
+            .iter()
+            .filter(|option| !used.contains(&option.value))
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn available_fallback_options_for_row(
+        &self,
+        row: usize,
+        options: &[OpenClawModelOption],
+    ) -> Vec<OpenClawModelOption> {
+        let current = self
+            .fallbacks
+            .get(row)
+            .map(String::as_str)
+            .unwrap_or_default();
+        let used = self
+            .fallbacks
+            .iter()
+            .enumerate()
+            .filter(|(index, value)| *index != row && !value.trim().is_empty())
+            .map(|(_, value)| value.as_str())
+            .chain((!self.primary_model.trim().is_empty()).then_some(self.primary_model.as_str()))
+            .collect::<std::collections::HashSet<_>>();
+
+        options
+            .iter()
+            .filter(|option| option.value == current || !used.contains(option.value.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn current_fallback_picker_selection(
+        &self,
+        row: usize,
+        options: &[OpenClawModelOption],
+    ) -> usize {
+        self.fallbacks
+            .get(row)
+            .map(|current| model_picker_selection(current, options))
+            .unwrap_or(OPENCLAW_AGENTS_MODEL_PICKER_NONE)
+    }
+
+    pub(crate) fn set_current_fallback(&mut self, row: usize, value: String) {
+        let Some(current) = self.fallbacks.get_mut(row) else {
+            return;
+        };
+        *current = value;
+    }
+
+    pub(crate) fn remove_current_fallback(&mut self) {
+        if self.row >= self.fallbacks.len() {
+            return;
+        }
+        self.fallbacks.remove(self.row);
+        self.row = self
+            .row
+            .min(self.rows_in_section(self.section).saturating_sub(1));
+    }
+
+    pub(crate) fn selected_runtime_field(&self) -> Option<OpenClawAgentsRuntimeField> {
+        (self.section == OpenClawAgentsSection::Runtime)
+            .then(|| OpenClawAgentsRuntimeField::from_row(self.row))
+            .flatten()
+    }
+
+    pub(crate) fn runtime_field_value(&self, field: OpenClawAgentsRuntimeField) -> &str {
+        match field {
+            OpenClawAgentsRuntimeField::Workspace => &self.workspace,
+            OpenClawAgentsRuntimeField::Timeout => &self.timeout,
+            OpenClawAgentsRuntimeField::ContextTokens => &self.context_tokens,
+            OpenClawAgentsRuntimeField::MaxConcurrent => &self.max_concurrent,
+        }
+    }
+
+    pub(crate) fn set_runtime_field(&mut self, field: OpenClawAgentsRuntimeField, value: String) {
+        match field {
+            OpenClawAgentsRuntimeField::Workspace => self.workspace = value,
+            OpenClawAgentsRuntimeField::Timeout => self.timeout = value,
+            OpenClawAgentsRuntimeField::ContextTokens => self.context_tokens = value,
+            OpenClawAgentsRuntimeField::MaxConcurrent => self.max_concurrent = value,
+        }
+    }
+
+    pub(crate) fn clear_runtime_field(&mut self, field: OpenClawAgentsRuntimeField) {
+        match field {
+            OpenClawAgentsRuntimeField::Workspace => self.workspace.clear(),
+            OpenClawAgentsRuntimeField::Timeout => {
+                self.timeout.clear();
+                self.timeout_seconds_seed = None;
+                self.has_legacy_timeout = false;
+            }
+            OpenClawAgentsRuntimeField::ContextTokens => {
+                self.context_tokens.clear();
+                self.context_tokens_seed = None;
+            }
+            OpenClawAgentsRuntimeField::MaxConcurrent => {
+                self.max_concurrent.clear();
+                self.max_concurrent_seed = None;
+            }
+        }
+    }
+
+    pub(crate) fn to_config(&self) -> crate::openclaw_config::OpenClawAgentsDefaults {
+        self.to_form_like().to_config()
+    }
+
+    fn rows_in_section(&self, section: OpenClawAgentsSection) -> usize {
+        match section {
+            OpenClawAgentsSection::PrimaryModel => 1,
+            OpenClawAgentsSection::FallbackModels => self.fallbacks.len() + 1,
+            OpenClawAgentsSection::Runtime => 4,
+        }
+    }
+
+    pub(crate) fn has_unmigratable_legacy_timeout(&self) -> bool {
+        const MAX_TIMEOUT_PARSE_BYTES: usize = 128;
+        if self.timeout.len() > MAX_TIMEOUT_PARSE_BYTES {
+            return self.has_legacy_timeout;
+        }
+        self.has_legacy_timeout
+            && !self.timeout.trim().is_empty()
+            && crate::cli::openclaw_form_normalization::parse_number(self.timeout.trim()).is_none()
+    }
+
+    fn to_form_like(&self) -> crate::cli::openclaw_form_normalization::OpenClawAgentsFormLike {
+        crate::cli::openclaw_form_normalization::OpenClawAgentsFormLike {
+            primary_model: self.primary_model.clone(),
+            fallbacks: self.fallbacks.clone(),
+            workspace: self.workspace.clone(),
+            timeout: self.timeout.clone(),
+            timeout_seconds_seed: self.timeout_seconds_seed.clone(),
+            context_tokens: self.context_tokens.clone(),
+            context_tokens_seed: self.context_tokens_seed.clone(),
+            max_concurrent: self.max_concurrent.clone(),
+            max_concurrent_seed: self.max_concurrent_seed.clone(),
+            model_catalog: self.model_catalog.clone(),
+            defaults_extra: self.defaults_extra.clone(),
+            model_extra: self.model_extra.clone(),
+            has_legacy_timeout: self.has_legacy_timeout,
+        }
+    }
+
+    fn clamp_section(&self, section: OpenClawAgentsSection) -> OpenClawAgentsSection {
+        section
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct OpenClawToolsFormState {
+    pub profile: Option<String>,
+    pub allow: Vec<String>,
+    pub deny: Vec<String>,
+    pub extra: HashMap<String, Value>,
+    pub section: OpenClawToolsSection,
+    pub row: usize,
+}
+
+impl OpenClawToolsFormState {
+    pub(crate) fn from_snapshot(
+        tools: Option<&crate::openclaw_config::OpenClawToolsConfig>,
+    ) -> Self {
+        let tools = tools.cloned().unwrap_or_default();
+        Self {
+            profile: tools.profile,
+            allow: tools.allow,
+            deny: tools.deny,
+            extra: tools.extra,
+            section: OpenClawToolsSection::Profile,
+            row: 0,
+        }
+    }
+
+    pub(crate) fn move_down(&mut self) {
+        self.section = self.clamp_section(self.section);
+        let rows = self.rows_in_section(self.section);
+        if self.row + 1 < rows {
+            self.row += 1;
+            return;
+        }
+
+        match self.section {
+            OpenClawToolsSection::Profile => {
+                self.section = OpenClawToolsSection::Allow;
+                self.row = 0;
+            }
+            OpenClawToolsSection::Allow => {
+                self.section = OpenClawToolsSection::Deny;
+                self.row = 0;
+            }
+            OpenClawToolsSection::Deny => {
+                self.section = OpenClawToolsSection::Deny;
+                self.row = self.rows_in_section(self.section).saturating_sub(1);
+            }
+        }
+    }
+
+    pub(crate) fn move_up(&mut self) {
+        self.section = self.clamp_section(self.section);
+        if self.row > 0 {
+            self.row -= 1;
+            return;
+        }
+
+        self.section = match self.section {
+            OpenClawToolsSection::Profile => OpenClawToolsSection::Profile,
+            OpenClawToolsSection::Allow => OpenClawToolsSection::Profile,
+            OpenClawToolsSection::Deny => OpenClawToolsSection::Allow,
+        };
+        self.row = self.rows_in_section(self.section).saturating_sub(1);
+    }
+
+    pub(crate) fn restore_position(&mut self, previous: &Self) {
+        self.section = self.clamp_section(previous.section);
+        self.row = previous
+            .row
+            .min(self.rows_in_section(self.section).saturating_sub(1));
+    }
+
+    pub(crate) fn selected_rule_row(&self) -> Option<usize> {
+        let list = self.list(self.section)?;
+        (self.row < list.len()).then_some(self.row)
+    }
+
+    pub(crate) fn selected_rule_value(&self) -> Option<&str> {
+        let row = self.selected_rule_row()?;
+        self.list(self.section)
+            .and_then(|list| list.get(row))
+            .map(String::as_str)
+    }
+
+    pub(crate) fn upsert_rule(
+        &mut self,
+        section: OpenClawToolsSection,
+        row: Option<usize>,
+        value: String,
+    ) {
+        let Some(list) = self.list_mut(section) else {
+            return;
+        };
+
+        let next_row = match row {
+            Some(index) if index < list.len() => {
+                list[index] = value;
+                index
+            }
+            Some(index) => {
+                let index = index.min(list.len());
+                list.insert(index, value);
+                index
+            }
+            None => {
+                list.push(value);
+                list.len().saturating_sub(1)
+            }
+        };
+
+        self.section = section;
+        self.row = next_row;
+    }
+
+    pub(crate) fn remove_current_list_item(&mut self) {
+        let row = self.row;
+        if let Some(list) = self.list_mut(self.section) {
+            if row < list.len() {
+                list.remove(row);
+            }
+        }
+        self.row = self
+            .row
+            .min(self.rows_in_section(self.section).saturating_sub(1));
+    }
+
+    pub(crate) fn to_config(&self) -> crate::openclaw_config::OpenClawToolsConfig {
+        crate::openclaw_config::OpenClawToolsConfig {
+            profile: self.profile.clone(),
+            allow: self
+                .allow
+                .iter()
+                .filter_map(|value| {
+                    let trimmed = value.trim();
+                    (!trimmed.is_empty()).then(|| trimmed.to_string())
+                })
+                .collect(),
+            deny: self
+                .deny
+                .iter()
+                .filter_map(|value| {
+                    let trimmed = value.trim();
+                    (!trimmed.is_empty()).then(|| trimmed.to_string())
+                })
+                .collect(),
+            extra: self.extra.clone(),
+        }
+    }
+
+    fn rows_in_section(&self, section: OpenClawToolsSection) -> usize {
+        match section {
+            OpenClawToolsSection::Profile => 1,
+            OpenClawToolsSection::Allow => self.allow.len() + 1,
+            OpenClawToolsSection::Deny => self.deny.len() + 1,
+        }
+    }
+
+    fn list(&self, section: OpenClawToolsSection) -> Option<&Vec<String>> {
+        match section {
+            OpenClawToolsSection::Allow => Some(&self.allow),
+            OpenClawToolsSection::Deny => Some(&self.deny),
+            _ => None,
+        }
+    }
+
+    fn list_mut(&mut self, section: OpenClawToolsSection) -> Option<&mut Vec<String>> {
+        match section {
+            OpenClawToolsSection::Allow => Some(&mut self.allow),
+            OpenClawToolsSection::Deny => Some(&mut self.deny),
+            _ => None,
+        }
+    }
+
+    fn clamp_section(&self, section: OpenClawToolsSection) -> OpenClawToolsSection {
+        section
+    }
+}
+
+pub(crate) fn openclaw_agents_model_options(data: &UiData) -> Vec<OpenClawModelOption> {
+    let mut labels = std::collections::BTreeMap::new();
+
+    for row in &data.providers.rows {
+        let provider_name = if row.provider.name.trim().is_empty() {
+            row.id.as_str()
+        } else {
+            row.provider.name.as_str()
+        };
+
+        let Some(models) = row
+            .provider
+            .settings_config
+            .get("models")
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+
+        for model in models {
+            let Some(model_id) = model.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            if model_id.trim().is_empty() {
+                continue;
+            }
+
+            let value = format!("{}/{}", row.id, model_id);
+            let model_name = model
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or(model_id);
+            labels.entry(value).or_insert_with(|| OpenClawModelOption {
+                label: format!("{provider_name} / {model_name}"),
+                value: format!("{}/{}", row.id, model_id),
+            });
+        }
+    }
+
+    let mut options = labels.into_values().collect::<Vec<_>>();
+    options.sort_by(|left, right| left.label.cmp(&right.label));
+    options
+}
+
+fn model_picker_selection(current: &str, options: &[OpenClawModelOption]) -> usize {
+    options
+        .iter()
+        .position(|option| option.value == current)
+        .unwrap_or(OPENCLAW_AGENTS_MODEL_PICKER_NONE)
+}
+
+pub(crate) const OPENCLAW_WARNING_SCAN_ITEMS: usize = 128;
+const OPENCLAW_WARNING_PATH_MATCH_MAX_BYTES: usize = 4 * 1024;
+
+pub(crate) fn bounded_openclaw_config_path(path: Option<&Path>) -> Option<&str> {
+    let encoded = path?.as_os_str().as_encoded_bytes();
+    if encoded.len() > OPENCLAW_WARNING_PATH_MATCH_MAX_BYTES {
+        return None;
+    }
+    std::str::from_utf8(encoded).ok()
+}
+
+fn openclaw_warning_matches_path(
+    warning: &crate::openclaw_config::OpenClawHealthWarning,
+    config_path: Option<&str>,
+    section_root: &str,
+    section_prefix: &str,
+) -> bool {
+    match warning.path.as_deref() {
+        None => true,
+        Some(path) if config_path == Some(path) => true,
+        Some(path) => path == section_root || path.starts_with(section_prefix),
+    }
+}
+
+fn openclaw_has_matching_warning(
+    data: &UiData,
+    section_root: &str,
+    section_prefix: &str,
+    section_missing: bool,
+) -> bool {
+    let config_path = bounded_openclaw_config_path(data.config.openclaw_config_path.as_deref());
+    let warnings = data.config.openclaw_warnings.as_deref().unwrap_or_default();
+
+    // A missing section plus more warnings than the render-time inspection
+    // budget is an uncertain parse state. Fail closed so an uninspected
+    // warning can never let an empty form overwrite malformed source data.
+    if section_missing && warnings.len() > OPENCLAW_WARNING_SCAN_ITEMS {
+        return true;
+    }
+
+    warnings
+        .iter()
+        .take(OPENCLAW_WARNING_SCAN_ITEMS)
+        .any(|warning| {
+            (section_missing || warning.code == "config_parse_failed")
+                && openclaw_warning_matches_path(warning, config_path, section_root, section_prefix)
+        })
+}
+
+pub(crate) fn openclaw_tools_load_failed(data: &UiData) -> bool {
+    data.config.openclaw_tools.is_none()
+        && openclaw_has_matching_warning(data, "tools", "tools.", true)
+}
+
+pub(crate) fn openclaw_tools_has_blocking_warning(data: &UiData) -> bool {
+    openclaw_has_matching_warning(
+        data,
+        "tools",
+        "tools.",
+        data.config.openclaw_tools.is_none(),
+    )
+}
+
+pub(crate) fn openclaw_agents_load_failed(data: &UiData) -> bool {
+    data.config.openclaw_agents_defaults.is_none()
+        && openclaw_has_matching_warning(data, "agents.defaults", "agents.defaults.", true)
+}
+
+pub(crate) fn openclaw_agents_has_blocking_warning(data: &UiData) -> bool {
+    openclaw_has_matching_warning(
+        data,
+        "agents.defaults",
+        "agents.defaults.",
+        data.config.openclaw_agents_defaults.is_none(),
+    )
+}
+
+impl<'a> OpenClawDailyMemoryListItem<'a> {
+    pub(crate) fn filename(&self) -> &str {
+        match self {
+            Self::File(row) => &row.filename,
+            Self::Search(row) => &row.filename,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn preview(&self) -> &str {
+        match self {
+            Self::File(row) => &row.preview,
+            Self::Search(row) => &row.snippet,
+        }
+    }
+}
+
+pub(crate) fn route_has_content_list(route: &Route) -> bool {
+    matches!(
+        route,
+        Route::Providers
+            | Route::Usage
+            | Route::UsageLogs
+            | Route::UsageLogDetail { .. }
+            | Route::Pricing
+            | Route::Sessions
+            | Route::Mcp
+            | Route::Prompts
+            | Route::HermesMemory
+            | Route::Config
+            | Route::ConfigOpenClawWorkspace
+            | Route::ConfigOpenClawDailyMemory
+            | Route::ConfigOpenClawEnv
+            | Route::ConfigOpenClawTools
+            | Route::ConfigOpenClawAgents
+            | Route::ConfigCloudSync
+            | Route::ConfigWebDav
+            | Route::ConfigS3
+            | Route::Skills
+            | Route::SkillsDiscover
+            | Route::SkillsRepos
+            | Route::SkillDetail { .. }
+            | Route::Settings
+            | Route::SettingsProxy
+            | Route::SettingsManagedAccounts
+    )
+}
+
+pub(crate) fn session_key(session: &crate::session_manager::SessionMeta) -> String {
+    format!(
+        "{}:{}:{}",
+        session.provider_id,
+        session.session_id,
+        session.source_path.as_deref().unwrap_or_default()
+    )
+}
+
+/// Compare a persisted composite session key without allocating another
+/// `String`. Large authoritative scans can contain millions of rows, so callers
+/// that only need equality must not rebuild the key for every row.
+pub(crate) fn session_key_matches(
+    session: &crate::session_manager::SessionMeta,
+    key: &str,
+) -> bool {
+    let provider = session.provider_id.as_bytes();
+    let session_id = session.session_id.as_bytes();
+    let source = session
+        .source_path
+        .as_deref()
+        .unwrap_or_default()
+        .as_bytes();
+    let key = key.as_bytes();
+    let expected_len = provider
+        .len()
+        .saturating_add(1)
+        .saturating_add(session_id.len())
+        .saturating_add(1)
+        .saturating_add(source.len());
+    if key.len() != expected_len {
+        return false;
+    }
+
+    let Some(key) = key.strip_prefix(provider) else {
+        return false;
+    };
+    let Some(key) = key.strip_prefix(b":") else {
+        return false;
+    };
+    let Some(key) = key.strip_prefix(session_id) else {
+        return false;
+    };
+    let Some(key) = key.strip_prefix(b":") else {
+        return false;
+    };
+    key == source
+}
+
+#[cfg(test)]
+mod session_key_tests {
+    use super::*;
+
+    #[test]
+    fn composite_key_comparison_matches_builder_without_allocating() {
+        let row = crate::session_manager::SessionMeta {
+            provider_id: "claude".to_string(),
+            session_id: "session:with:colons".to_string(),
+            source_path: Some("/tmp/a:b/session.jsonl".to_string()),
+            ..crate::session_manager::SessionMeta::default()
+        };
+        let key = session_key(&row);
+
+        assert!(session_key_matches(&row, &key));
+        assert!(!session_key_matches(
+            &row,
+            "claude:session:with:colons:/other"
+        ));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn visible_sessions<'a>(
+    filter: &FilterState,
+    app_type: &AppType,
+    rows: &'a [crate::session_manager::SessionMeta],
+) -> Vec<&'a crate::session_manager::SessionMeta> {
+    let query = filter.query_lower();
+    let provider_id = app_type.as_str();
+    rows.iter()
+        .filter(|row| row.provider_id == provider_id)
+        .filter(|row| match &query {
+            None => true,
+            Some(q) => session_matches_filter(row, q),
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionVisibilityKey {
+    rows_ptr: usize,
+    rows_len: usize,
+    rows_revision: u64,
+    query: Option<String>,
+    app_provider_id: String,
+    rows_provider_id: Option<String>,
+    project_scope: Option<crate::session_manager::project_scope::SessionProjectScope>,
+    detail_key: Option<String>,
+    messages_revision: u64,
+    messages_loaded: bool,
+    deep_search_query: Option<String>,
+    deep_search_seq: u64,
+    deep_results_ptr: usize,
+    deep_results_len: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SessionVisibilityCache {
+    key: Option<SessionVisibilityKey>,
+    indices: std::rc::Rc<Vec<usize>>,
+    rebuilds: u64,
+}
+
+#[cfg(test)]
+impl SessionVisibilityCache {
+    pub(crate) fn rebuilds(&self) -> u64 {
+        self.rebuilds
+    }
+}
+
+pub(crate) enum SessionRowsView<'a> {
+    All(&'a [crate::session_manager::SessionMeta]),
+    Filtered {
+        rows: &'a [crate::session_manager::SessionMeta],
+        indices: std::rc::Rc<Vec<usize>>,
+    },
+}
+
+impl<'a> SessionRowsView<'a> {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::All(rows) => rows.len(),
+            Self::Filtered { indices, .. } => indices.len(),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub(crate) fn get(&self, index: usize) -> Option<&'a crate::session_manager::SessionMeta> {
+        match self {
+            Self::All(rows) => rows.get(index),
+            Self::Filtered { rows, indices } => indices
+                .get(index)
+                .and_then(|row_index| rows.get(*row_index)),
+        }
+    }
+
+    pub(crate) fn iter(
+        &self,
+    ) -> impl Iterator<Item = &'a crate::session_manager::SessionMeta> + '_ {
+        (0..self.len()).filter_map(|index| self.get(index))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SessionProjectOption<'a> {
+    All {
+        session_count: usize,
+    },
+    Unknown {
+        session_count: usize,
+    },
+    Exact {
+        display_path: &'a str,
+        normalized_path: &'a str,
+        session_count: usize,
+    },
+}
+
+impl SessionProjectOption<'_> {
+    pub(crate) fn session_count(self) -> usize {
+        match self {
+            Self::All { session_count }
+            | Self::Unknown { session_count }
+            | Self::Exact { session_count, .. } => session_count,
+        }
+    }
+}
+
+pub(crate) fn session_project_option_count(
+    sessions: &SessionsState,
+    picker: &SessionProjectPickerState,
+) -> usize {
+    let Some(cache) = sessions
+        .project_catalog
+        .as_ref()
+        .filter(|_| sessions.project_catalog_is_current())
+    else {
+        return 0;
+    };
+    let show_unknown = cache.catalog.unknown.session_count > 0
+        || matches!(
+            sessions.project_scope,
+            crate::session_manager::project_scope::SessionProjectScope::Unknown
+        );
+    1usize
+        .saturating_add(usize::from(show_unknown))
+        .saturating_add(usize::from(picker.pinned_scope.is_some()))
+        .saturating_add(cache.catalog.projects.len())
+}
+
+pub(crate) fn session_project_option_at<'a>(
+    sessions: &'a SessionsState,
+    picker: &'a SessionProjectPickerState,
+    index: usize,
+) -> Option<SessionProjectOption<'a>> {
+    let cache = sessions
+        .project_catalog
+        .as_ref()
+        .filter(|_| sessions.project_catalog_is_current())?;
+    if index == 0 {
+        return Some(SessionProjectOption::All {
+            session_count: sessions
+                .base_manifest
+                .as_ref()
+                .map_or(0, |base| base.total_rows),
+        });
+    }
+
+    let mut cursor = 1usize;
+    if let Some(crate::session_manager::project_scope::SessionProjectScope::Exact {
+        display_path,
+        normalized_path,
+    }) = picker.pinned_scope.as_ref()
+    {
+        if index == cursor {
+            return Some(SessionProjectOption::Exact {
+                display_path,
+                normalized_path,
+                session_count: 0,
+            });
+        }
+        cursor = cursor.saturating_add(1);
+    }
+
+    if let Some(project) = index
+        .checked_sub(cursor)
+        .and_then(|project_index| cache.catalog.projects.get(project_index))
+    {
+        return Some(SessionProjectOption::Exact {
+            display_path: &project.display_path,
+            normalized_path: &project.normalized_path,
+            session_count: project.session_count,
+        });
+    }
+
+    let show_unknown = cache.catalog.unknown.session_count > 0
+        || matches!(
+            sessions.project_scope,
+            crate::session_manager::project_scope::SessionProjectScope::Unknown
+        );
+    let unknown_index = cursor.saturating_add(cache.catalog.projects.len());
+    (show_unknown && index == unknown_index).then_some(SessionProjectOption::Unknown {
+        session_count: cache.catalog.unknown.session_count,
+    })
+}
+
+pub(crate) fn session_project_picker_pinned_scope(
+    sessions: &SessionsState,
+) -> Option<crate::session_manager::project_scope::SessionProjectScope> {
+    let crate::session_manager::project_scope::SessionProjectScope::Exact {
+        normalized_path, ..
+    } = &sessions.project_scope
+    else {
+        return None;
+    };
+    let catalog = sessions
+        .project_catalog
+        .as_ref()
+        .filter(|_| sessions.project_catalog_is_current())?;
+    catalog
+        .catalog
+        .project_position(normalized_path)
+        .is_none()
+        .then(|| sessions.project_scope.clone())
+}
+
+pub(crate) fn session_project_option_scope(
+    option: SessionProjectOption<'_>,
+) -> crate::session_manager::project_scope::SessionProjectScope {
+    match option {
+        SessionProjectOption::All { .. } => {
+            crate::session_manager::project_scope::SessionProjectScope::All
+        }
+        SessionProjectOption::Unknown { .. } => {
+            crate::session_manager::project_scope::SessionProjectScope::Unknown
+        }
+        SessionProjectOption::Exact {
+            display_path,
+            normalized_path,
+            ..
+        } => crate::session_manager::project_scope::SessionProjectScope::Exact {
+            display_path: display_path.to_string(),
+            normalized_path: normalized_path.to_string(),
+        },
+    }
+}
+
+pub(crate) fn session_project_active_option_index(
+    sessions: &SessionsState,
+    picker: &SessionProjectPickerState,
+) -> usize {
+    let Some(cache) = sessions
+        .project_catalog
+        .as_ref()
+        .filter(|_| sessions.project_catalog_is_current())
+    else {
+        return 0;
+    };
+    match &sessions.project_scope {
+        crate::session_manager::project_scope::SessionProjectScope::All => 0,
+        crate::session_manager::project_scope::SessionProjectScope::Unknown => 1usize
+            .saturating_add(usize::from(picker.pinned_scope.is_some()))
+            .saturating_add(cache.catalog.projects.len()),
+        crate::session_manager::project_scope::SessionProjectScope::Exact {
+            normalized_path,
+            ..
+        } => {
+            if picker.pinned_scope.is_some() {
+                1
+            } else {
+                cache
+                    .catalog
+                    .project_position(normalized_path)
+                    .map(|index| 1usize.saturating_add(index))
+                    .unwrap_or(0)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SessionProjectFilterSource {
+    pub(crate) catalog:
+        std::sync::Arc<crate::session_manager::project_scope::SessionProjectCatalog>,
+    pub(crate) project_offset: usize,
+    pub(crate) fixed_matches: Vec<usize>,
+    pub(crate) trailing_matches: Vec<usize>,
+}
+
+pub(crate) fn session_project_filter_source(
+    sessions: &SessionsState,
+    picker: &SessionProjectPickerState,
+    query_lower: &str,
+) -> Option<SessionProjectFilterSource> {
+    let cache = sessions
+        .project_catalog
+        .as_ref()
+        .filter(|_| sessions.project_catalog_is_current())?;
+    let mut fixed_matches = Vec::with_capacity(2);
+    if texts::tui_sessions_all_projects()
+        .to_lowercase()
+        .contains(query_lower)
+    {
+        fixed_matches.push(0);
+    }
+    let mut cursor = 1usize;
+    if let Some(crate::session_manager::project_scope::SessionProjectScope::Exact {
+        display_path,
+        ..
+    }) = picker.pinned_scope.as_ref()
+    {
+        if crate::session_manager::project_scope::project_path_contains_query(
+            display_path,
+            query_lower,
+        ) {
+            fixed_matches.push(cursor);
+        }
+        cursor = cursor.saturating_add(1);
+    }
+    let show_unknown = cache.catalog.unknown.session_count > 0
+        || matches!(
+            sessions.project_scope,
+            crate::session_manager::project_scope::SessionProjectScope::Unknown
+        );
+    let unknown_index = cursor.saturating_add(cache.catalog.projects.len());
+    let trailing_matches = (show_unknown
+        && texts::tui_sessions_unknown_project()
+            .to_lowercase()
+            .contains(query_lower))
+    .then_some(unknown_index)
+    .into_iter()
+    .collect();
+    Some(SessionProjectFilterSource {
+        catalog: std::sync::Arc::clone(&cache.catalog),
+        project_offset: cursor,
+        fixed_matches,
+        trailing_matches,
+    })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "session visibility combines route, filter, loaded-detail, and deep-search state"
+)]
+pub(crate) fn visible_sessions_for_state<'a>(
+    filter: &FilterState,
+    app_type: &AppType,
+    rows_provider_id: Option<&str>,
+    project_scope: &crate::session_manager::project_scope::SessionProjectScope,
+    rows: &'a [crate::session_manager::SessionMeta],
+    detail_key: Option<&str>,
+    messages_loaded: bool,
+    messages: &[crate::session_manager::SessionMessage],
+    deep_search_query: Option<&str>,
+    deep_search_results: &[crate::session_manager::SessionSearchHit],
+    materialized_view: bool,
+    rows_revision: u64,
+    messages_revision: u64,
+    deep_search_seq: u64,
+    visibility_cache: &std::cell::RefCell<SessionVisibilityCache>,
+) -> SessionRowsView<'a> {
+    let query = (!materialized_view).then(|| filter.query_lower()).flatten();
+    let deep_search_query = (!materialized_view).then_some(deep_search_query).flatten();
+    let project_scope = (!materialized_view
+        && !matches!(
+            project_scope,
+            crate::session_manager::project_scope::SessionProjectScope::All
+        ))
+    .then_some(project_scope);
+    let provider_id = app_type.as_str();
+    if query.is_none()
+        && deep_search_query.is_none()
+        && project_scope.is_none()
+        && rows_provider_id == Some(provider_id)
+    {
+        return SessionRowsView::All(rows);
+    }
+
+    let key = SessionVisibilityKey {
+        rows_ptr: rows.as_ptr() as usize,
+        rows_len: rows.len(),
+        rows_revision,
+        query: query.clone(),
+        app_provider_id: provider_id.to_string(),
+        rows_provider_id: rows_provider_id.map(str::to_string),
+        project_scope: project_scope.cloned(),
+        detail_key: detail_key.map(str::to_string),
+        messages_revision,
+        messages_loaded,
+        deep_search_query: deep_search_query.map(str::to_string),
+        deep_search_seq,
+        deep_results_ptr: deep_search_results.as_ptr() as usize,
+        deep_results_len: deep_search_results.len(),
+    };
+    {
+        let mut cache = visibility_cache.borrow_mut();
+        if cache.key.as_ref() != Some(&key) {
+            let message_match_key = query.as_deref().and_then(|_| {
+                loaded_detail_message_match_key(filter, detail_key, messages_loaded, messages)
+            });
+            let deep_search_source_paths: Option<std::collections::HashSet<&str>> =
+                deep_search_query.map(|_| {
+                    deep_search_results
+                        .iter()
+                        .map(|hit| hit.source_path.as_str())
+                        .collect()
+                });
+
+            let indices = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.provider_id == provider_id)
+                .filter(|(_, row)| {
+                    project_scope.is_none_or(|scope| scope.matches(row.project_dir.as_deref()))
+                })
+                .filter(|(_, row)| {
+                    if let Some(ref hit_paths) = deep_search_source_paths {
+                        let in_hits = row
+                            .source_path
+                            .as_deref()
+                            .is_some_and(|path| hit_paths.contains(path));
+                        let meta_match = query.as_deref().is_some_and(|query| {
+                            session_matches_filter(row, query)
+                                || message_match_key
+                                    .as_deref()
+                                    .is_some_and(|key| session_key_matches(row, key))
+                        });
+                        return in_hits || meta_match;
+                    }
+                    query.as_deref().is_none_or(|query| {
+                        session_matches_filter(row, query)
+                            || message_match_key
+                                .as_deref()
+                                .is_some_and(|key| session_key_matches(row, key))
+                    })
+                })
+                .map(|(index, _)| index)
+                .collect();
+            cache.indices = std::rc::Rc::new(indices);
+            cache.key = Some(key);
+            cache.rebuilds = cache.rebuilds.wrapping_add(1);
+        }
+    }
+
+    SessionRowsView::Filtered {
+        rows,
+        indices: std::rc::Rc::clone(&visibility_cache.borrow().indices),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionMessageVisibilityKey {
+    messages_ptr: usize,
+    messages_len: usize,
+    messages_revision: u64,
+    query: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SessionMessageVisibilityCache {
+    key: Option<SessionMessageVisibilityKey>,
+    indices: std::rc::Rc<Vec<usize>>,
+    rebuilds: u64,
+}
+
+#[cfg(test)]
+impl SessionMessageVisibilityCache {
+    pub(crate) fn rebuilds(&self) -> u64 {
+        self.rebuilds
+    }
+}
+
+pub(crate) enum SessionMessagesView<'a> {
+    All(&'a [crate::session_manager::SessionMessage]),
+    Filtered {
+        messages: &'a [crate::session_manager::SessionMessage],
+        indices: std::rc::Rc<Vec<usize>>,
+    },
+}
+
+impl<'a> SessionMessagesView<'a> {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::All(messages) => messages.len(),
+            Self::Filtered { indices, .. } => indices.len(),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub(crate) fn get(
+        &self,
+        visible_index: usize,
+    ) -> Option<(usize, &'a crate::session_manager::SessionMessage)> {
+        match self {
+            Self::All(messages) => messages
+                .get(visible_index)
+                .map(|message| (visible_index, message)),
+            Self::Filtered { messages, indices } => {
+                indices.get(visible_index).and_then(|message_index| {
+                    messages
+                        .get(*message_index)
+                        .map(|message| (*message_index, message))
+                })
+            }
+        }
+    }
+
+    pub(crate) fn first(&self) -> Option<(usize, &'a crate::session_manager::SessionMessage)> {
+        self.get(0)
+    }
+
+    pub(crate) fn visible_index_of(&self, message_index: usize) -> Option<usize> {
+        match self {
+            Self::All(messages) => (message_index < messages.len()).then_some(message_index),
+            Self::Filtered { indices, .. } => indices.binary_search(&message_index).ok(),
+        }
+    }
+
+    pub(crate) fn by_message_index(
+        &self,
+        message_index: usize,
+    ) -> Option<&'a crate::session_manager::SessionMessage> {
+        let visible_index = self.visible_index_of(message_index)?;
+        self.get(visible_index).map(|(_, message)| message)
+    }
+}
+
+pub(crate) fn visible_session_messages(sessions: &SessionsState) -> SessionMessagesView<'_> {
+    let query = sessions.message_query_lower();
+    let Some(query) = query else {
+        return SessionMessagesView::All(&sessions.messages);
+    };
+    let key = SessionMessageVisibilityKey {
+        messages_ptr: sessions.messages.as_ptr() as usize,
+        messages_len: sessions.messages.len(),
+        messages_revision: sessions.messages_revision,
+        query: query.clone(),
+    };
+    {
+        let mut cache = sessions.message_visibility_cache.borrow_mut();
+        if cache.key.as_ref() != Some(&key) {
+            let indices = sessions
+                .messages
+                .iter()
+                .enumerate()
+                .filter(|(_, message)| session_message_matches_message_filter(message, &query))
+                .map(|(index, _)| index)
+                .collect();
+            cache.indices = std::rc::Rc::new(indices);
+            cache.key = Some(key);
+            cache.rebuilds = cache.rebuilds.wrapping_add(1);
+        }
+    }
+    SessionMessagesView::Filtered {
+        messages: &sessions.messages,
+        indices: std::rc::Rc::clone(&sessions.message_visibility_cache.borrow().indices),
+    }
+}
+
+pub(crate) fn clamp_session_message_selection(sessions: &mut SessionsState) {
+    let selected = {
+        let visible = visible_session_messages(sessions);
+        if visible.is_empty() {
+            Some(0)
+        } else if visible.visible_index_of(sessions.message_idx).is_some() {
+            None
+        } else {
+            visible.first().map(|(index, _)| index)
+        }
+    };
+    if let Some(selected) = selected {
+        sessions.message_idx = selected;
+    }
+    sessions.sync_loaded_message_selection();
+}
+
+fn loaded_detail_message_match_key(
+    filter: &FilterState,
+    detail_key: Option<&str>,
+    messages_loaded: bool,
+    messages: &[crate::session_manager::SessionMessage],
+) -> Option<String> {
+    let key = detail_key?;
+    if !messages_loaded || messages.is_empty() {
+        return None;
+    }
+    let query = filter.query_lower()?;
+    messages
+        .iter()
+        .any(|message| session_message_matches_filter(message, &query))
+        .then(|| key.to_string())
+}
+
+fn session_matches_filter(session: &crate::session_manager::SessionMeta, query: &str) -> bool {
+    filter_text_matches(&session.provider_id, query)
+        || filter_text_matches(&session.session_id, query)
+        || filter_option_text_matches(session.title.as_deref(), query)
+        || filter_option_text_matches(session.summary.as_deref(), query)
+        || filter_option_path_matches(session.project_dir.as_deref(), query)
+        || filter_option_path_matches(session.source_path.as_deref(), query)
+        || filter_option_text_matches(session.resume_command.as_deref(), query)
+        || filter_timestamp_matches(session.last_active_at.or(session.created_at), query)
+}
+
+fn session_message_matches_filter(
+    message: &crate::session_manager::SessionMessage,
+    query: &str,
+) -> bool {
+    filter_text_matches(&message.role, query)
+        || filter_text_matches(
+            &crate::cli::i18n::texts::tui_sessions_role_label(&message.role),
+            query,
+        )
+        || filter_text_matches(&message.content, query)
+        || filter_timestamp_matches(message.ts, query)
+}
+
+fn session_message_matches_message_filter(
+    message: &crate::session_manager::SessionMessage,
+    query: &str,
+) -> bool {
+    if let Some(role) = session_message_role_query(query) {
+        return message.role.eq_ignore_ascii_case(role);
+    }
+
+    session_message_matches_filter(message, query)
+}
+
+fn session_message_role_query(query: &str) -> Option<&'static str> {
+    match query.trim() {
+        "user" | "用户" => Some("user"),
+        "assistant" | "ai" | "助手" => Some("assistant"),
+        "system" | "系统" => Some("system"),
+        "tool" | "工具" => Some("tool"),
+        "developer" | "开发者" => Some("developer"),
+        _ => None,
+    }
+}
+
+fn filter_option_text_matches(value: Option<&str>, query: &str) -> bool {
+    value.is_some_and(|value| filter_text_matches(value, query))
+}
+
+fn filter_option_path_matches(value: Option<&str>, query: &str) -> bool {
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return false;
+    };
+    filter_text_matches(value, query) || filter_text_matches(&path_basename(value), query)
+}
+
+fn filter_text_matches(value: &str, query: &str) -> bool {
+    value.to_lowercase().contains(query)
+}
+
+fn filter_timestamp_matches(timestamp_ms: Option<i64>, query: &str) -> bool {
+    if !query.chars().any(|ch| ch.is_ascii_digit()) {
+        return false;
+    }
+    let Some(timestamp_ms) = timestamp_ms else {
+        return false;
+    };
+    let Some(datetime) = Local.timestamp_millis_opt(timestamp_ms).single() else {
+        return false;
+    };
+    let slash_date = datetime.format("%Y/%m/%d").to_string();
+    slash_date.contains(query) || datetime.format("%Y-%m-%d").to_string().contains(query)
+}
+
+fn path_basename(path: &str) -> String {
+    let trimmed = path.trim().trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    Path::new(trimmed)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
+pub(crate) fn route_default_focus(route: &Route) -> Focus {
+    match route {
+        Route::Main => Focus::Nav,
+        _ => Focus::Content,
+    }
+}
+
+pub(crate) fn visible_providers<'a>(
+    app_type: &AppType,
+    filter: &FilterState,
+    data: &'a UiData,
+) -> Vec<&'a super::data::ProviderRow> {
+    let query = filter.query_lower();
+    data.providers
+        .rows
+        .iter()
+        .filter(|row| match &query {
+            None => true,
+            Some(q) => {
+                super::data::provider_display_name(app_type, row)
+                    .to_lowercase()
+                    .contains(q)
+                    || row.provider.name.to_lowercase().contains(q)
+                    || row.id.to_lowercase().contains(q)
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn failover_queue_rows(data: &UiData) -> Vec<&super::data::ProviderRow> {
+    let mut rows = data.providers.rows.iter().collect::<Vec<_>>();
+    rows.sort_by(
+        |a, b| match (a.provider.in_failover_queue, b.provider.in_failover_queue) {
+            (true, true) => match (a.provider.sort_index, b.provider.sort_index) {
+                (Some(a_idx), Some(b_idx)) => a_idx.cmp(&b_idx).then_with(|| a.id.cmp(&b.id)),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.id.cmp(&b.id),
+            },
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            (false, false) => a.id.cmp(&b.id),
+        },
+    );
+    rows
+}
+
+pub(crate) fn failover_queue_selected_index(
+    data: &UiData,
+    selected_provider_id: Option<&str>,
+) -> Option<usize> {
+    let rows = failover_queue_rows(data);
+    selected_provider_id
+        .and_then(|provider_id| rows.iter().position(|row| row.id == provider_id))
+        .or_else(|| (!rows.is_empty()).then_some(0))
+}
+
+pub(crate) fn failover_queue_position(data: &UiData, provider_id: &str) -> Option<usize> {
+    failover_queue_rows(data)
+        .into_iter()
+        .filter(|row| row.provider.in_failover_queue)
+        .position(|row| row.id == provider_id)
+        .map(|idx| idx + 1)
+}
+
+pub(crate) fn supports_provider_stream_check(app_type: &AppType) -> bool {
+    !matches!(app_type, AppType::OpenClaw)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderTestMenuItem {
+    Speedtest,
+    StreamCheck,
+}
+
+pub(crate) fn provider_test_menu_items(app_type: &AppType) -> Vec<ProviderTestMenuItem> {
+    let mut items = vec![ProviderTestMenuItem::Speedtest];
+    if supports_provider_stream_check(app_type) {
+        items.push(ProviderTestMenuItem::StreamCheck);
+    }
+    items
+}
+
+pub(crate) fn provider_test_menu_item_label(item: ProviderTestMenuItem) -> &'static str {
+    match item {
+        ProviderTestMenuItem::Speedtest => texts::tui_key_speedtest(),
+        ProviderTestMenuItem::StreamCheck => texts::tui_key_stream_check(),
+    }
+}
+
+pub(crate) fn visible_mcp<'a>(
+    filter: &FilterState,
+    data: &'a UiData,
+) -> Vec<&'a super::data::McpRow> {
+    let query = filter.query_lower();
+    data.mcp
+        .rows
+        .iter()
+        .filter(|row| match &query {
+            None => true,
+            Some(q) => {
+                row.server.name.to_lowercase().contains(q) || row.id.to_lowercase().contains(q)
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn visible_pricing_rows<'a>(
+    filter: &FilterState,
+    data: &'a UiData,
+) -> Vec<&'a super::data::ModelPricingRow> {
+    let query = filter.query_lower();
+    data.pricing
+        .rows
+        .iter()
+        .filter(|row| match &query {
+            None => true,
+            Some(q) => {
+                filter_text_matches(&row.model_id, q) || filter_text_matches(&row.display_name, q)
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn visible_prompts<'a>(
+    filter: &FilterState,
+    data: &'a UiData,
+) -> Vec<&'a super::data::PromptRow> {
+    let query = filter.query_lower();
+    data.prompts
+        .rows
+        .iter()
+        .filter(|row| match &query {
+            None => true,
+            Some(q) => {
+                row.prompt.name.to_lowercase().contains(q) || row.id.to_lowercase().contains(q)
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn visible_skills_installed<'a>(
+    filter: &FilterState,
+    data: &'a UiData,
+) -> Vec<&'a crate::services::skill::InstalledSkill> {
+    let query = filter.query_lower();
+    data.skills
+        .installed
+        .iter()
+        .filter(|skill| match &query {
+            None => true,
+            Some(q) => {
+                skill.name.to_lowercase().contains(q)
+                    || skill.directory.to_lowercase().contains(q)
+                    || skill.id.to_lowercase().contains(q)
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn visible_skills_discover<'a>(
+    filter: &FilterState,
+    skills: &'a [crate::services::skill::Skill],
+) -> Vec<&'a crate::services::skill::Skill> {
+    let query = filter.query_lower();
+    skills
+        .iter()
+        .filter(|skill| match &query {
+            None => true,
+            Some(q) => {
+                skill.name.to_lowercase().contains(q)
+                    || skill.directory.to_lowercase().contains(q)
+                    || skill.key.to_lowercase().contains(q)
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn visible_skills_repos<'a>(
+    filter: &FilterState,
+    data: &'a UiData,
+) -> Vec<&'a crate::services::skill::SkillRepo> {
+    let query = filter.query_lower();
+    data.skills
+        .repos
+        .iter()
+        .filter(|repo| match &query {
+            None => true,
+            Some(q) => {
+                repo.owner.to_lowercase().contains(q)
+                    || repo.name.to_lowercase().contains(q)
+                    || repo.branch.to_lowercase().contains(q)
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn visible_skills_unmanaged<'a>(
+    filter: &FilterState,
+    skills: &'a [crate::services::skill::UnmanagedSkill],
+) -> Vec<&'a crate::services::skill::UnmanagedSkill> {
+    let query = filter.query_lower();
+    skills
+        .iter()
+        .filter(|skill| match &query {
+            None => true,
+            Some(q) => {
+                skill.name.to_lowercase().contains(q)
+                    || skill.directory.to_lowercase().contains(q)
+                    || skill
+                        .description
+                        .as_deref()
+                        .unwrap_or_default()
+                        .to_lowercase()
+                        .contains(q)
+                    || skill.found_in.iter().any(|s| s.to_lowercase().contains(q))
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn visible_config_items(filter: &FilterState, app_type: &AppType) -> Vec<ConfigItem> {
+    let all = ConfigItem::ALL
+        .iter()
+        .filter(|item| item.listed_in_config_menu(app_type))
+        .cloned()
+        .collect::<Vec<_>>();
+    let Some(q) = filter.query_lower() else {
+        return all;
+    };
+
+    all.into_iter()
+        .filter(|item| {
+            item.label().to_lowercase().contains(&q)
+                || matches!(item, ConfigItem::CloudSync)
+                    && "cloud sync webdav s3 云同步".contains(&q)
+        })
+        .collect()
+}
+
+pub(crate) fn openclaw_workspace_entry_count() -> usize {
+    OpenClawWorkspaceRow::all().len()
+}
+
+#[cfg(test)]
+pub(crate) fn openclaw_workspace_rows() -> Vec<OpenClawWorkspaceRow> {
+    OpenClawWorkspaceRow::all()
+}
+
+pub(crate) fn openclaw_workspace_row(index: usize) -> Option<OpenClawWorkspaceRow> {
+    OpenClawWorkspaceRow::from_index(index)
+}
+
+pub(crate) fn visible_openclaw_daily_memory<'a>(
+    app: &'a App,
+    data: &'a UiData,
+) -> Vec<OpenClawDailyMemoryListItem<'a>> {
+    if !app.openclaw_daily_memory_search_query.trim().is_empty() {
+        app.openclaw_daily_memory_search_results
+            .iter()
+            .map(OpenClawDailyMemoryListItem::Search)
+            .collect()
+    } else {
+        data.config
+            .openclaw_workspace
+            .daily_memory_files
+            .iter()
+            .map(OpenClawDailyMemoryListItem::File)
+            .collect()
+    }
+}
+
+pub(crate) fn config_item_label(item: &ConfigItem) -> &'static str {
+    item.label()
+}
+
+pub(crate) fn visible_webdav_config_items(filter: &FilterState) -> Vec<WebDavConfigItem> {
+    let all = WebDavConfigItem::ALL.to_vec();
+    let Some(q) = filter.query_lower() else {
+        return all;
+    };
+
+    all.into_iter()
+        .filter(|item| item.label().to_lowercase().contains(&q))
+        .collect()
+}
+
+pub(crate) fn webdav_config_item_label(item: &WebDavConfigItem) -> &'static str {
+    item.label()
+}
+
+pub(crate) fn cycle_app_type(current: &AppType, dir: i8) -> Option<AppType> {
+    let visible_apps = crate::settings::get_visible_apps();
+    if visible_apps.ordered_enabled().len() <= 1 {
+        return None;
+    }
+
+    crate::settings::next_visible_app(&visible_apps, current, dir).filter(|next| next != current)
+}
+
+pub(crate) fn app_type_picker_index(app_type: &AppType) -> usize {
+    match app_type {
+        AppType::Claude => 0,
+        AppType::Codex => 1,
+        AppType::Gemini => 2,
+        AppType::OpenCode => 3,
+        AppType::Hermes => 4,
+        AppType::OpenClaw => 5,
+    }
+}
+
+pub(crate) fn four_app_picker_index(app_type: &AppType) -> usize {
+    app_type_picker_index(app_type).min(4)
+}
+
+pub(crate) fn app_type_for_picker_index(index: usize) -> AppType {
+    match index {
+        1 => AppType::Codex,
+        2 => AppType::Gemini,
+        3 => AppType::OpenCode,
+        4 => AppType::Hermes,
+        5 => AppType::OpenClaw,
+        _ => AppType::Claude,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn snippet_picker_index_for_app_type(app_type: &AppType) -> usize {
+    app_type_picker_index(app_type)
+}
+
+pub(crate) fn snippet_picker_app_type(index: usize) -> AppType {
+    app_type_for_picker_index(index)
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn sync_method_picker_index(method: SyncMethod) -> usize {
+    match method {
+        SyncMethod::Auto => 0,
+        SyncMethod::Symlink => 1,
+        SyncMethod::Copy => 2,
+    }
+}
+
+pub(crate) fn sync_method_for_picker_index(index: usize) -> SyncMethod {
+    match index {
+        1 => SyncMethod::Symlink,
+        2 => SyncMethod::Copy,
+        _ => SyncMethod::Auto,
+    }
+}
+
+pub(crate) fn openclaw_tools_profile_picker_index(profile: Option<&str>) -> Option<usize> {
+    OPENCLAW_TOOLS_PROFILE_PICKER_VALUES
+        .iter()
+        .position(|value| *value == profile)
+}
+
+pub(crate) fn openclaw_tools_profile_for_picker_index(index: usize) -> Option<&'static str> {
+    OPENCLAW_TOOLS_PROFILE_PICKER_VALUES
+        .get(index)
+        .copied()
+        .flatten()
+}
+
+pub(crate) fn openclaw_tools_profile_picker_label(index: usize) -> &'static str {
+    match index {
+        1 => texts::tui_openclaw_tools_profile_minimal(),
+        2 => texts::tui_openclaw_tools_profile_coding(),
+        3 => texts::tui_openclaw_tools_profile_messaging(),
+        4 => texts::tui_openclaw_tools_profile_full(),
+        _ => texts::tui_openclaw_tools_profile_unset(),
+    }
+}
+
+pub(crate) fn is_save_shortcut(key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char('s' | 'S') => key.modifiers.contains(KeyModifiers::CONTROL),
+        KeyCode::Char('\u{13}') => true,
+        _ => false,
+    }
+}
+
+pub(crate) fn is_open_external_editor_shortcut(key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char('o' | 'O') => key.modifiers.contains(KeyModifiers::CONTROL),
+        _ => false,
+    }
+}

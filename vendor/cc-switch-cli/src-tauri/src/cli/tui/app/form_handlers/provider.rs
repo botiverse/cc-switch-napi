@@ -1,0 +1,2025 @@
+use super::*;
+use crate::ProviderService;
+use url::Url;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderValidationTarget {
+    Main(ProviderAddField),
+    UsageScript,
+}
+
+impl App {
+    pub(super) fn handle_provider_template_key(
+        &mut self,
+        key: KeyEvent,
+        data: &UiData,
+    ) -> Option<Action> {
+        let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+            return None;
+        };
+
+        if !matches!(provider.page, form::ProviderFormPage::Main) {
+            return None;
+        }
+
+        if provider.focus != FormFocus::Templates || !matches!(provider.mode, FormMode::Add) {
+            return None;
+        }
+
+        match key.code {
+            KeyCode::Left => {
+                provider.template_idx = provider.template_idx.saturating_sub(1);
+                Some(Action::None)
+            }
+            KeyCode::Right => {
+                let max = provider.template_count().saturating_sub(1);
+                provider.template_idx = (provider.template_idx + 1).min(max);
+                Some(Action::None)
+            }
+            KeyCode::Enter => {
+                let existing_ids = data.existing_provider_ids();
+                provider.apply_template(provider.template_idx, &existing_ids);
+                let refresh_result =
+                    provider.refresh_quick_config_from_common_snippet(&data.config.common_snippet);
+                provider.focus = FormFocus::Fields;
+                if let Err(err) = refresh_result {
+                    self.push_toast(err, ToastKind::Warning);
+                }
+                Some(Action::None)
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn handle_provider_focus_key(
+        &mut self,
+        key: KeyEvent,
+        data: &UiData,
+    ) -> Option<Action> {
+        let Some(FormState::ProviderAdd(provider)) = self.form.as_ref() else {
+            return None;
+        };
+
+        if matches!(provider.page, form::ProviderFormPage::UsageQuery) {
+            return self.handle_usage_query_page_key(key, data);
+        }
+        if matches!(provider.page, form::ProviderFormPage::CodexModelCatalog) {
+            return self.handle_codex_model_catalog_page_key(key);
+        }
+        if matches!(provider.page, form::ProviderFormPage::CodexLocalRouting) {
+            return self.handle_codex_local_routing_page_key(key, data);
+        }
+        if matches!(provider.page, form::ProviderFormPage::LocalProxySettings) {
+            return self.handle_local_proxy_settings_page_key(key);
+        }
+        if matches!(provider.page, form::ProviderFormPage::ClaudeQuickConfig) {
+            return self.handle_claude_quick_config_page_key(key, data);
+        }
+        if matches!(provider.page, form::ProviderFormPage::CodexQuickConfig) {
+            return self.handle_codex_quick_config_page_key(key, data);
+        }
+
+        match provider.focus {
+            FormFocus::Fields => self.handle_provider_fields_key(key, data),
+            FormFocus::JsonPreview => self.handle_provider_json_preview_key(key, data),
+            FormFocus::Templates | FormFocus::Content => None,
+        }
+    }
+
+    pub(super) fn build_provider_form_save_action(&mut self, data: &UiData) -> Action {
+        let validation = {
+            let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                return Action::None;
+            };
+            provider.refresh_usage_query_provider_kind();
+            provider.field_errors.clear();
+            provider.usage_query_field_errors.clear();
+            if let Some(message) = provider.usage_query_script_validation_error() {
+                provider.set_usage_query_field_error(form::UsageQueryField::Script, message);
+            }
+            let hermes_base_url_error =
+                matches!(provider.app_type, crate::app_config::AppType::Hermes)
+                    .then(|| validate_hermes_base_url(&provider.hermes_base_url.value))
+                    .flatten();
+
+            if ProviderService::is_provider_key_app(&provider.app_type) && provider.id.is_blank() {
+                Some((
+                    ProviderValidationTarget::Main(ProviderAddField::Id),
+                    texts::tui_toast_provider_add_missing_fields().to_string(),
+                ))
+            } else if ProviderService::validate_provider_key_for_add(
+                &provider.app_type,
+                provider.id.value.as_str(),
+            )
+            .is_err()
+            {
+                Some((
+                    ProviderValidationTarget::Main(ProviderAddField::Id),
+                    texts::tui_hermes_provider_key_invalid().to_string(),
+                ))
+            } else if provider.name.is_blank() {
+                Some((
+                    ProviderValidationTarget::Main(ProviderAddField::Name),
+                    if provider.mode.is_edit() {
+                        texts::tui_toast_provider_missing_name().to_string()
+                    } else {
+                        texts::tui_toast_provider_add_missing_fields().to_string()
+                    },
+                ))
+            } else if matches!(provider.app_type, crate::app_config::AppType::Hermes)
+                && !is_valid_hermes_rate_limit_delay(&provider.hermes_rate_limit_delay.value)
+            {
+                Some((
+                    ProviderValidationTarget::Main(ProviderAddField::HermesRateLimitDelay),
+                    texts::tui_hermes_rate_limit_delay_invalid().to_string(),
+                ))
+            } else if let Some(message) = hermes_base_url_error {
+                Some((
+                    ProviderValidationTarget::Main(ProviderAddField::HermesBaseUrl),
+                    message.to_string(),
+                ))
+            } else if matches!(provider.app_type, crate::app_config::AppType::Codex)
+                && !provider.is_codex_official_provider()
+                && provider.codex_base_url.is_blank()
+            {
+                Some((
+                    ProviderValidationTarget::Main(ProviderAddField::CodexBaseUrl),
+                    texts::base_url_empty_error().to_string(),
+                ))
+            } else if matches!(provider.app_type, crate::app_config::AppType::Codex)
+                && matches!(provider.claude_api_format, form::ClaudeApiFormat::Anthropic)
+                && !is_valid_codex_max_output_tokens(&provider.codex_max_output_tokens.value)
+            {
+                Some((
+                    ProviderValidationTarget::Main(ProviderAddField::CodexMaxOutputTokens),
+                    texts::tui_codex_max_output_tokens_invalid().to_string(),
+                ))
+            } else if let Some(message) = validate_usage_query_form(provider) {
+                Some((ProviderValidationTarget::UsageScript, message.to_string()))
+            } else if !provider.ensure_generated_id(&data.existing_provider_ids()) {
+                Some((
+                    ProviderValidationTarget::Main(ProviderAddField::Name),
+                    if provider.mode.is_edit() {
+                        texts::tui_toast_provider_missing_name().to_string()
+                    } else {
+                        texts::tui_toast_provider_add_missing_fields().to_string()
+                    },
+                ))
+            } else {
+                None
+            }
+        };
+
+        if let Some((target, message)) = validation {
+            if let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() {
+                match target {
+                    ProviderValidationTarget::Main(field) => {
+                        provider.page = form::ProviderFormPage::Main;
+                        provider.focus = FormFocus::Fields;
+                        provider.sync_main_field_index(field);
+                        provider.set_main_field_error(field, message.clone());
+                    }
+                    ProviderValidationTarget::UsageScript => {
+                        provider.open_usage_query_page();
+                        provider.focus = FormFocus::JsonPreview;
+                        provider.set_usage_query_field_error(
+                            form::UsageQueryField::Script,
+                            message.clone(),
+                        );
+                    }
+                }
+            }
+            self.push_toast(message, ToastKind::Warning);
+            return Action::None;
+        }
+
+        let local_proxy_validation = self.form.as_ref().and_then(|form| match form {
+            FormState::ProviderAdd(provider) => validate_local_proxy_settings_form(provider),
+            _ => None,
+        });
+        if let Some(message) = local_proxy_validation {
+            self.push_toast(message, ToastKind::Error);
+            return Action::None;
+        }
+
+        let invalid_custom_user_agent = self.form.as_ref().is_some_and(|form| {
+            matches!(
+                form,
+                FormState::ProviderAdd(provider)
+                    if provider.supports_local_proxy_settings()
+                        && !provider.custom_user_agent_is_valid()
+            )
+        });
+        if invalid_custom_user_agent {
+            self.push_toast(texts::tui_user_agent_invalid_hint(), ToastKind::Warning);
+        }
+
+        let Some(FormState::ProviderAdd(provider)) = self.form.as_ref() else {
+            return Action::None;
+        };
+
+        let provider_json = provider.to_provider_json_value();
+        let content =
+            serde_json::to_string_pretty(&provider_json).unwrap_or_else(|_| "{}".to_string());
+
+        Action::EditorSubmit {
+            submit: match &provider.mode {
+                FormMode::Add => EditorSubmit::ProviderAdd,
+                FormMode::Edit { id } => EditorSubmit::ProviderEdit { id: id.clone() },
+            },
+            content,
+        }
+    }
+
+    fn handle_provider_fields_key(&mut self, key: KeyEvent, data: &UiData) -> Option<Action> {
+        let editing_field = self.form.as_ref().and_then(|form| match form {
+            FormState::ProviderAdd(provider) => match provider.text_edit_target() {
+                Some(form::ProviderTextField::Main(field)) => Some(field),
+                _ => None,
+            },
+            _ => None,
+        });
+        if let Some(field) = editing_field {
+            return self.handle_provider_field_editing(field, key, data);
+        }
+
+        let (fields, selected) = self.prepare_provider_field_selection()?;
+        self.handle_provider_field_navigation(fields, selected, key, data)
+    }
+
+    fn handle_provider_field_editing(
+        &mut self,
+        selected: ProviderAddField,
+        key: KeyEvent,
+        data: &UiData,
+    ) -> Option<Action> {
+        match key.code {
+            KeyCode::Esc => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return None;
+                };
+                provider.cancel_text_edit();
+                Some(Action::None)
+            }
+            KeyCode::Enter => {
+                self.commit_active_text_edit(data);
+                Some(Action::None)
+            }
+            _ => {
+                TextEditCommand::from_key(key)?;
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return None;
+                };
+                let policy = TextInputPolicy {
+                    max_chars: (selected == ProviderAddField::Notes)
+                        .then_some(PROVIDER_NOTES_MAX_CHARS),
+                    sanitize: provider_field_sanitize_fn(&provider.app_type, selected),
+                };
+                let changed = provider
+                    .input_mut(selected)
+                    .and_then(|input| input.apply_key_with_policy(key, policy))
+                    .map(|edit| edit.changed)
+                    .unwrap_or(false);
+                if changed {
+                    provider.clear_main_field_error(selected);
+                }
+                provider.sync_main_field_index(selected);
+                Some(Action::None)
+            }
+        }
+    }
+
+    fn handle_provider_field_navigation(
+        &mut self,
+        fields: Vec<ProviderAddField>,
+        selected: ProviderAddField,
+        key: KeyEvent,
+        data: &UiData,
+    ) -> Option<Action> {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return None;
+                };
+                provider.field_idx = provider.field_idx.saturating_sub(1);
+                while provider.field_idx > 0
+                    && is_provider_divider_field(fields.get(provider.field_idx))
+                {
+                    provider.field_idx = provider.field_idx.saturating_sub(1);
+                }
+                Some(Action::None)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return None;
+                };
+                provider.field_idx = (provider.field_idx + 1).min(fields.len() - 1);
+                while provider.field_idx < fields.len().saturating_sub(1)
+                    && is_provider_divider_field(fields.get(provider.field_idx))
+                {
+                    provider.field_idx = (provider.field_idx + 1).min(fields.len() - 1);
+                }
+                Some(Action::None)
+            }
+            KeyCode::Char('f')
+                if matches!(
+                    selected,
+                    ProviderAddField::CodexModel
+                        | ProviderAddField::GeminiModel
+                        | ProviderAddField::OpenCodeModelId
+                ) =>
+            {
+                Some(self.handle_provider_model_fetch(selected))
+            }
+            KeyCode::Char('f')
+                if matches!(
+                    selected,
+                    ProviderAddField::ClaudeBaseUrl | ProviderAddField::CodexBaseUrl
+                ) =>
+            {
+                let (enabled, app_type) = {
+                    let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                        return None;
+                    };
+                    if !provider.supports_full_url_mode() {
+                        return Some(Action::None);
+                    }
+                    (provider.toggle_full_url_mode(), provider.app_type.clone())
+                };
+                if enabled
+                    && !data
+                        .proxy
+                        .routes_current_app_through_proxy(&app_type)
+                        .unwrap_or(false)
+                {
+                    self.overlay = Overlay::Confirm(ConfirmOverlay {
+                        title: texts::tui_claude_api_format_requires_proxy_title().to_string(),
+                        message: texts::tui_full_url_requires_proxy_message().to_string(),
+                        action: ConfirmAction::ProviderApiFormatProxyNotice,
+                    });
+                }
+                Some(Action::None)
+            }
+            KeyCode::Char(' ') | KeyCode::Enter => {
+                Some(self.handle_provider_field_activate(selected, key, data))
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_provider_field_activate(
+        &mut self,
+        selected: ProviderAddField,
+        key: KeyEvent,
+        data: &UiData,
+    ) -> Action {
+        match selected {
+            ProviderAddField::ClaudeApiFormat => {
+                if !matches!(key.code, KeyCode::Enter) {
+                    return Action::None;
+                }
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_ref() else {
+                    return Action::None;
+                };
+                self.overlay = Overlay::ClaudeApiFormatPicker {
+                    selected: provider
+                        .claude_api_format
+                        .picker_index_for_app(&provider.app_type),
+                };
+                Action::None
+            }
+            ProviderAddField::CodexAnthropicApiKeyField => {
+                if !matches!(key.code, KeyCode::Enter) {
+                    return Action::None;
+                }
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return Action::None;
+                };
+                provider.claude_api_key_field = match provider.claude_api_key_field {
+                    crate::provider::ClaudeApiKeyField::AuthToken => {
+                        crate::provider::ClaudeApiKeyField::ApiKey
+                    }
+                    crate::provider::ClaudeApiKeyField::ApiKey => {
+                        crate::provider::ClaudeApiKeyField::AuthToken
+                    }
+                };
+                Action::None
+            }
+            ProviderAddField::CodexImpersonateClaudeCode => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return Action::None;
+                };
+                provider.codex_impersonate_claude_code = !provider.codex_impersonate_claude_code;
+                Action::None
+            }
+            ProviderAddField::CodexPromptCacheRouting => {
+                if !matches!(key.code, KeyCode::Enter) {
+                    return Action::None;
+                }
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return Action::None;
+                };
+                provider.cycle_codex_prompt_cache_routing();
+                Action::None
+            }
+            ProviderAddField::CodexWireApi => {
+                if !matches!(key.code, KeyCode::Enter) {
+                    return Action::None;
+                }
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return Action::None;
+                };
+                provider.codex_wire_api = match provider.codex_wire_api {
+                    CodexWireApi::Chat => CodexWireApi::Responses,
+                    CodexWireApi::Responses => CodexWireApi::Chat,
+                };
+                Action::None
+            }
+            ProviderAddField::CodexRequiresOpenaiAuth => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return Action::None;
+                };
+                provider.codex_requires_openai_auth = !provider.codex_requires_openai_auth;
+                Action::None
+            }
+            ProviderAddField::IncludeCommonConfig => {
+                let toggle_result = {
+                    let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                        return Action::None;
+                    };
+                    provider.toggle_include_common_config(&data.config.common_snippet)
+                };
+                if let Err(err) = toggle_result {
+                    self.push_toast(err, ToastKind::Warning);
+                }
+                Action::None
+            }
+            ProviderAddField::GeminiAuthType => {
+                if !matches!(key.code, KeyCode::Enter) {
+                    return Action::None;
+                }
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return Action::None;
+                };
+                provider.gemini_auth_type = match provider.gemini_auth_type {
+                    GeminiAuthType::OAuth => GeminiAuthType::ApiKey,
+                    GeminiAuthType::ApiKey => GeminiAuthType::OAuth,
+                };
+                Action::None
+            }
+            ProviderAddField::OpenClawApiProtocol => {
+                if !matches!(key.code, KeyCode::Enter) {
+                    return Action::None;
+                }
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return Action::None;
+                };
+                provider
+                    .opencode_npm_package
+                    .set(next_openclaw_api_protocol(
+                        &provider.opencode_npm_package.value,
+                    ));
+                Action::None
+            }
+            ProviderAddField::OpenClawUserAgent => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return Action::None;
+                };
+                provider.openclaw_user_agent = !provider.openclaw_user_agent;
+                Action::None
+            }
+            ProviderAddField::HermesApiMode => {
+                if !matches!(key.code, KeyCode::Enter) {
+                    return Action::None;
+                }
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return Action::None;
+                };
+                provider.cycle_hermes_api_mode();
+                Action::None
+            }
+            ProviderAddField::ClaudeModelConfig => {
+                if matches!(key.code, KeyCode::Enter) {
+                    self.overlay = Overlay::ClaudeModelPicker {
+                        selected: 0,
+                        column: ClaudeModelPickerColumn::Model,
+                        editing: false,
+                    };
+                }
+                Action::None
+            }
+            ProviderAddField::ClaudeQuickConfig => {
+                if !matches!(key.code, KeyCode::Enter) {
+                    return Action::None;
+                }
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return Action::None;
+                };
+                provider.open_claude_quick_config_page();
+                Action::None
+            }
+            ProviderAddField::CodexQuickConfig => {
+                if !matches!(key.code, KeyCode::Enter) {
+                    return Action::None;
+                }
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return Action::None;
+                };
+                provider.open_codex_quick_config_page();
+                Action::None
+            }
+            ProviderAddField::CodexGoalMode => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return Action::None;
+                };
+                provider.toggle_codex_goal_mode();
+                Action::None
+            }
+            ProviderAddField::CodexRemoteCompaction => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return Action::None;
+                };
+                provider.toggle_codex_remote_compaction();
+                Action::None
+            }
+            ProviderAddField::ClaudeHideAttribution => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return Action::None;
+                };
+                provider.toggle_claude_hide_attribution();
+                Action::None
+            }
+            ProviderAddField::ClaudeTeammates => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return Action::None;
+                };
+                provider.toggle_claude_teammates();
+                Action::None
+            }
+            ProviderAddField::ClaudeToolSearch => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return Action::None;
+                };
+                provider.toggle_claude_tool_search();
+                Action::None
+            }
+            ProviderAddField::ClaudeEffortMax => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return Action::None;
+                };
+                provider.toggle_claude_effort_max();
+                Action::None
+            }
+            ProviderAddField::ClaudeDisableAutoUpgrade => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return Action::None;
+                };
+                provider.toggle_claude_disable_auto_upgrade();
+                Action::None
+            }
+            ProviderAddField::CodexOAuthAccount => {
+                if matches!(key.code, KeyCode::Enter) {
+                    let selected = self
+                        .form
+                        .as_ref()
+                        .and_then(|form| match form {
+                            FormState::ProviderAdd(provider) => {
+                                Some(provider.codex_oauth_account_id.clone())
+                            }
+                            _ => None,
+                        })
+                        .flatten();
+                    self.overlay = Overlay::ManagedAccountPicker {
+                        auth_provider: "codex_oauth".to_string(),
+                        selected: 0,
+                        binding: true,
+                        selected_account_id: selected,
+                    };
+                    // managed_auth status is no longer fetched at startup, so pull
+                    // it on demand the first time this picker is opened.
+                    if self.managed_auth_status.is_none() {
+                        return Action::ManagedAuthRefresh {
+                            auth_provider: "codex_oauth".to_string(),
+                        };
+                    }
+                }
+                Action::None
+            }
+            ProviderAddField::CodexFastMode => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return Action::None;
+                };
+                provider.toggle_codex_fast_mode();
+                Action::None
+            }
+            ProviderAddField::OpenClawModels => {
+                if matches!(key.code, KeyCode::Enter) {
+                    let Some(FormState::ProviderAdd(provider)) = self.form.as_ref() else {
+                        return Action::None;
+                    };
+                    self.open_editor(
+                        texts::tui_openclaw_models_editor_title(),
+                        EditorKind::Json,
+                        provider.openclaw_models_editor_text(),
+                        EditorSubmit::ProviderFormApplyOpenClawModels,
+                    );
+                    if let Some(editor) = self.editor.as_mut() {
+                        editor.mode = EditorMode::Edit;
+                    }
+                }
+                Action::None
+            }
+            ProviderAddField::HermesModels => {
+                if matches!(key.code, KeyCode::Enter) {
+                    let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                        return Action::None;
+                    };
+                    provider.open_hermes_models_picker();
+                    self.overlay = Overlay::HermesModelsPicker { editing: false };
+                }
+                Action::None
+            }
+            ProviderAddField::CommonSnippet => {
+                if matches!(key.code, KeyCode::Enter) {
+                    let Some(FormState::ProviderAdd(provider)) = self.form.as_ref() else {
+                        return Action::None;
+                    };
+                    self.open_common_snippet_editor(
+                        provider.app_type.clone(),
+                        data,
+                        None,
+                        CommonSnippetViewSource::ProviderForm,
+                    );
+                }
+                Action::None
+            }
+            ProviderAddField::UsageQuery => {
+                if matches!(key.code, KeyCode::Enter) {
+                    self.open_usage_query_page_with_notice();
+                }
+                Action::None
+            }
+            ProviderAddField::CodexLocalRouting => {
+                if matches!(key.code, KeyCode::Enter) {
+                    let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                        return Action::None;
+                    };
+                    provider.open_codex_local_routing_page();
+                }
+                Action::None
+            }
+            ProviderAddField::LocalProxySettings => {
+                if matches!(key.code, KeyCode::Enter) {
+                    let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                        return Action::None;
+                    };
+                    provider.open_local_proxy_settings_page();
+                }
+                Action::None
+            }
+            ProviderAddField::CodexModel
+            | ProviderAddField::GeminiModel
+            | ProviderAddField::OpenCodeModelId => {
+                self.handle_provider_model_field_activate(selected, key)
+            }
+            _ => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return Action::None;
+                };
+                if selected == ProviderAddField::Id && !provider.is_id_editable() {
+                    return Action::None;
+                }
+                if matches!(key.code, KeyCode::Enter) {
+                    provider.begin_main_text_edit(selected);
+                }
+                Action::None
+            }
+        }
+    }
+
+    fn handle_claude_quick_config_page_key(
+        &mut self,
+        key: KeyEvent,
+        data: &UiData,
+    ) -> Option<Action> {
+        let (fields, selected) = {
+            let Some(FormState::ProviderAdd(provider)) = self.form.as_ref() else {
+                return None;
+            };
+            let fields = provider.claude_quick_config_fields();
+            let selected = provider.selected_claude_quick_config_field()?;
+            (fields, selected)
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return None;
+                };
+                provider.close_claude_quick_config_page();
+                Some(Action::None)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return None;
+                };
+                provider.claude_quick_config_idx =
+                    provider.claude_quick_config_idx.saturating_sub(1);
+                Some(Action::None)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return None;
+                };
+                provider.claude_quick_config_idx =
+                    (provider.claude_quick_config_idx + 1).min(fields.len() - 1);
+                Some(Action::None)
+            }
+            KeyCode::Char(' ') | KeyCode::Enter => {
+                let toggle_result = {
+                    let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                        return None;
+                    };
+                    provider.toggle_claude_quick_config_field(selected, &data.config.common_snippet)
+                };
+                if let Err(err) = toggle_result {
+                    self.push_toast(err, ToastKind::Warning);
+                }
+                Some(Action::None)
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_codex_quick_config_page_key(
+        &mut self,
+        key: KeyEvent,
+        data: &UiData,
+    ) -> Option<Action> {
+        let (fields, selected) = {
+            let Some(FormState::ProviderAdd(provider)) = self.form.as_ref() else {
+                return None;
+            };
+            let fields = provider.codex_quick_config_fields();
+            let selected = provider.selected_codex_quick_config_field()?;
+            (fields, selected)
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return None;
+                };
+                provider.close_codex_quick_config_page();
+                Some(Action::None)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return None;
+                };
+                provider.codex_quick_config_idx = provider.codex_quick_config_idx.saturating_sub(1);
+                Some(Action::None)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return None;
+                };
+                provider.codex_quick_config_idx =
+                    (provider.codex_quick_config_idx + 1).min(fields.len() - 1);
+                Some(Action::None)
+            }
+            KeyCode::Char(' ') | KeyCode::Enter => {
+                let toggle_result = {
+                    let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                        return None;
+                    };
+                    provider.toggle_codex_quick_config_field(selected, &data.config.common_snippet)
+                };
+                if let Err(err) = toggle_result {
+                    self.push_toast(err, ToastKind::Warning);
+                }
+                Some(Action::None)
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_codex_local_routing_page_key(
+        &mut self,
+        key: KeyEvent,
+        data: &UiData,
+    ) -> Option<Action> {
+        let (fields, selected) = self.prepare_codex_local_routing_field_selection()?;
+
+        // The model catalog is inline: when its "field" is focused, keys drive
+        // the table instead of the toggle/reasoning field list.
+        if matches!(selected, form::CodexLocalRoutingField::ModelCatalog) {
+            return self.handle_codex_inline_catalog_key(key);
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return None;
+                };
+                provider.close_codex_local_routing_page();
+                Some(Action::None)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return None;
+                };
+                provider.codex_local_routing_field_idx =
+                    provider.codex_local_routing_field_idx.saturating_sub(1);
+                Some(Action::None)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return None;
+                };
+                provider.codex_local_routing_field_idx =
+                    (provider.codex_local_routing_field_idx + 1).min(fields.len() - 1);
+                // Entering the inline catalog zone starts at the first row.
+                if matches!(
+                    fields.get(provider.codex_local_routing_field_idx),
+                    Some(form::CodexLocalRoutingField::ModelCatalog)
+                ) {
+                    provider.codex_model_catalog_idx = 0;
+                }
+                Some(Action::None)
+            }
+            KeyCode::Char(' ') | KeyCode::Enter => {
+                Some(self.handle_codex_local_routing_field_activate(selected, data))
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_local_proxy_settings_page_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let selected = self.prepare_local_proxy_settings_field_selection()?;
+
+        Some(match key.code {
+            KeyCode::Esc => {
+                if let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() {
+                    provider.close_local_proxy_settings_page();
+                }
+                Action::None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() {
+                    provider.local_proxy_settings_field_idx =
+                        provider.local_proxy_settings_field_idx.saturating_sub(1);
+                }
+                Action::None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() {
+                    provider.local_proxy_settings_field_idx =
+                        (provider.local_proxy_settings_field_idx + 1).min(
+                            provider
+                                .local_proxy_settings_fields()
+                                .len()
+                                .saturating_sub(1),
+                        );
+                }
+                Action::None
+            }
+            KeyCode::Enter => {
+                match selected {
+                    form::LocalProxySettingsField::UserAgent => {
+                        self.open_user_agent_picker();
+                    }
+                    form::LocalProxySettingsField::HeaderOverrides => {
+                        let initial = self.form.as_ref().and_then(|form| match form {
+                            FormState::ProviderAdd(provider) => {
+                                Some(form::format_local_proxy_header_overrides(
+                                    &provider.local_proxy_header_overrides,
+                                ))
+                            }
+                            _ => None,
+                        });
+                        if let Some(initial) = initial {
+                            self.open_editor(
+                                texts::tui_local_proxy_headers_editor_title(),
+                                EditorKind::Json,
+                                initial,
+                                EditorSubmit::ProviderFormApplyLocalProxyHeaders,
+                            );
+                        }
+                    }
+                    form::LocalProxySettingsField::BodyOverrides => {
+                        let initial = self.form.as_ref().and_then(|form| match form {
+                            FormState::ProviderAdd(provider) => {
+                                Some(form::format_local_proxy_body_override(
+                                    provider.local_proxy_body_override.as_ref(),
+                                ))
+                            }
+                            _ => None,
+                        });
+                        if let Some(initial) = initial {
+                            self.open_editor(
+                                texts::tui_local_proxy_body_editor_title(),
+                                EditorKind::Json,
+                                initial,
+                                EditorSubmit::ProviderFormApplyLocalProxyBody,
+                            );
+                        }
+                    }
+                }
+                Action::None
+            }
+            _ => Action::None,
+        })
+    }
+
+    fn open_user_agent_picker(&mut self) {
+        let selected = self
+            .form
+            .as_ref()
+            .and_then(|form| match form {
+                FormState::ProviderAdd(provider) => Some(form::user_agent_picker_selection(
+                    &provider.custom_user_agent.value,
+                )),
+                _ => None,
+            })
+            .unwrap_or(form::USER_AGENT_PICKER_CUSTOM_INDEX);
+        self.overlay = Overlay::UserAgentPicker { selected };
+    }
+
+    /// Keys for the inline model-catalog table (when its zone is focused inside
+    /// the model-mapping page). Up at the first row leaves back to the fields.
+    fn handle_codex_inline_catalog_key(&mut self, key: KeyEvent) -> Option<Action> {
+        match key.code {
+            KeyCode::Esc => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return None;
+                };
+                provider.close_codex_local_routing_page();
+                Some(Action::None)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return None;
+                };
+                if provider.codex_model_catalog_idx == 0 {
+                    provider.codex_local_routing_field_idx =
+                        provider.codex_local_routing_field_idx.saturating_sub(1);
+                } else {
+                    provider.codex_model_catalog_idx -= 1;
+                }
+                Some(Action::None)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return None;
+                };
+                if !provider.codex_model_catalog.is_empty() {
+                    provider.codex_model_catalog_idx = (provider.codex_model_catalog_idx + 1)
+                        .min(provider.codex_model_catalog.len() - 1);
+                }
+                Some(Action::None)
+            }
+            KeyCode::Left => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return None;
+                };
+                provider.codex_model_catalog_field = form::CodexModelCatalogField::from_index(
+                    provider.codex_model_catalog_field.index().saturating_sub(1),
+                );
+                Some(Action::None)
+            }
+            KeyCode::Right => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return None;
+                };
+                provider.codex_model_catalog_field = form::CodexModelCatalogField::from_index(
+                    (provider.codex_model_catalog_field.index() + 1)
+                        .min(form::CodexModelCatalogField::ALL.len().saturating_sub(1)),
+                );
+                Some(Action::None)
+            }
+            KeyCode::Char('f') => Some(self.build_codex_model_catalog_fetch_action()),
+            KeyCode::Char('+') | KeyCode::Char('a') => {
+                self.open_codex_model_catalog_field_input(
+                    None,
+                    form::CodexModelCatalogField::Model,
+                    "",
+                );
+                Some(Action::None)
+            }
+            KeyCode::Enter => {
+                let (row, field, current) = match self.form.as_ref() {
+                    Some(FormState::ProviderAdd(provider))
+                        if !provider.codex_model_catalog.is_empty() =>
+                    {
+                        let row = provider.codex_model_catalog_idx;
+                        let field = provider.codex_model_catalog_field;
+                        let current = provider.selected_codex_model_catalog_field_value(field);
+                        (Some(row), field, current)
+                    }
+                    _ => (None, form::CodexModelCatalogField::Model, String::new()),
+                };
+                self.open_codex_model_catalog_field_input(row, field, &current);
+                Some(Action::None)
+            }
+            KeyCode::Delete | KeyCode::Backspace => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return None;
+                };
+                provider.remove_selected_codex_model_catalog_model();
+                Some(Action::None)
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_codex_local_routing_field_activate(
+        &mut self,
+        selected: form::CodexLocalRoutingField,
+        data: &UiData,
+    ) -> Action {
+        match selected {
+            form::CodexLocalRoutingField::Enabled => {
+                let (enabled, is_chat) = {
+                    let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                        return Action::None;
+                    };
+                    provider.toggle_codex_local_routing_enabled();
+                    (
+                        provider.codex_local_routing_enabled(),
+                        provider.codex_is_chat_format(),
+                    )
+                };
+                // Only Chat routing goes through the local proxy; native
+                // Responses mapping is a generated catalog file (no proxy).
+                if enabled
+                    && is_chat
+                    && !data
+                        .proxy
+                        .routes_current_app_through_proxy(&AppType::Codex)
+                        .unwrap_or(false)
+                {
+                    self.overlay = Overlay::Confirm(ConfirmOverlay {
+                        title: texts::tui_claude_api_format_requires_proxy_title().to_string(),
+                        message: texts::tui_codex_api_format_requires_proxy_message("openai_chat"),
+                        action: ConfirmAction::ProviderApiFormatProxyNotice,
+                    });
+                }
+                Action::None
+            }
+            form::CodexLocalRoutingField::SupportsThinking => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return Action::None;
+                };
+                if provider.codex_local_routing_enabled() {
+                    provider.toggle_codex_reasoning_thinking();
+                }
+                Action::None
+            }
+            form::CodexLocalRoutingField::SupportsEffort => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return Action::None;
+                };
+                if provider.codex_local_routing_enabled() {
+                    provider.toggle_codex_reasoning_effort();
+                }
+                Action::None
+            }
+            form::CodexLocalRoutingField::ModelCatalog => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return Action::None;
+                };
+                // Model mapping is available for both Chat and native Responses.
+                provider.open_codex_model_catalog_page();
+                Action::None
+            }
+        }
+    }
+
+    fn handle_codex_model_catalog_page_key(&mut self, key: KeyEvent) -> Option<Action> {
+        match key.code {
+            KeyCode::Esc => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return None;
+                };
+                provider.close_codex_model_catalog_page();
+                Some(Action::None)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return None;
+                };
+                provider.codex_model_catalog_idx =
+                    provider.codex_model_catalog_idx.saturating_sub(1);
+                Some(Action::None)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return None;
+                };
+                if !provider.codex_model_catalog.is_empty() {
+                    provider.codex_model_catalog_idx = (provider.codex_model_catalog_idx + 1)
+                        .min(provider.codex_model_catalog.len() - 1);
+                }
+                Some(Action::None)
+            }
+            KeyCode::Left => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return None;
+                };
+                provider.codex_model_catalog_field = form::CodexModelCatalogField::from_index(
+                    provider.codex_model_catalog_field.index().saturating_sub(1),
+                );
+                Some(Action::None)
+            }
+            KeyCode::Right => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return None;
+                };
+                provider.codex_model_catalog_field = form::CodexModelCatalogField::from_index(
+                    (provider.codex_model_catalog_field.index() + 1)
+                        .min(form::CodexModelCatalogField::ALL.len().saturating_sub(1)),
+                );
+                Some(Action::None)
+            }
+            KeyCode::Char('f') => Some(self.build_codex_model_catalog_fetch_action()),
+            KeyCode::Char('+') | KeyCode::Char('a') => {
+                self.open_codex_model_catalog_field_input(
+                    None,
+                    form::CodexModelCatalogField::Model,
+                    "",
+                );
+                Some(Action::None)
+            }
+            KeyCode::Enter => {
+                let (row, field, current) = match self.form.as_ref() {
+                    Some(FormState::ProviderAdd(provider))
+                        if !provider.codex_model_catalog.is_empty() =>
+                    {
+                        let row = provider.codex_model_catalog_idx;
+                        let field = provider.codex_model_catalog_field;
+                        let current = provider.selected_codex_model_catalog_field_value(field);
+                        (Some(row), field, current)
+                    }
+                    _ => (None, form::CodexModelCatalogField::Model, String::new()),
+                };
+                self.open_codex_model_catalog_field_input(row, field, &current);
+                Some(Action::None)
+            }
+            KeyCode::Delete | KeyCode::Backspace => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return None;
+                };
+                provider.remove_selected_codex_model_catalog_model();
+                Some(Action::None)
+            }
+            _ => None,
+        }
+    }
+
+    fn open_codex_model_catalog_field_input(
+        &mut self,
+        row: Option<usize>,
+        field: form::CodexModelCatalogField,
+        value: &str,
+    ) {
+        let prompt = match field {
+            form::CodexModelCatalogField::Model => texts::tui_codex_model_catalog_model_prompt(),
+            form::CodexModelCatalogField::DisplayName => {
+                texts::tui_codex_model_catalog_display_prompt()
+            }
+            form::CodexModelCatalogField::ContextWindow => {
+                texts::tui_codex_model_catalog_context_prompt()
+            }
+        };
+        self.overlay = Overlay::TextInput(TextInputState {
+            title: texts::tui_codex_model_catalog().to_string(),
+            prompt: prompt.to_string(),
+            input: TextInput::new(value),
+            submit: TextSubmit::CodexModelCatalogField { row, field },
+        });
+    }
+
+    fn build_codex_model_catalog_fetch_action(&mut self) -> Action {
+        let Some(FormState::ProviderAdd(provider)) = self.form.as_ref() else {
+            return Action::None;
+        };
+        let base_url = provider.codex_base_url.value.trim();
+        if base_url.is_empty() {
+            self.push_toast(texts::tui_model_fetch_need_endpoint(), ToastKind::Warning);
+            return Action::None;
+        }
+
+        Action::ProviderModelFetch {
+            base_url: provider.codex_base_url.value.clone(),
+            is_full_url: provider.is_full_url,
+            api_key: (!provider.codex_api_key.value.trim().is_empty())
+                .then(|| provider.codex_api_key.value.clone()),
+            custom_user_agent: (!provider.custom_user_agent.value.trim().is_empty())
+                .then(|| provider.custom_user_agent.value.clone()),
+            codex_oauth: false,
+            codex_oauth_account_id: None,
+            field: ProviderAddField::CodexLocalRouting,
+            claude_idx: None,
+        }
+    }
+
+    fn handle_usage_query_page_key(&mut self, key: KeyEvent, data: &UiData) -> Option<Action> {
+        let Some(FormState::ProviderAdd(provider)) = self.form.as_ref() else {
+            return None;
+        };
+        if matches!(provider.focus, FormFocus::JsonPreview) {
+            if !provider.usage_query_extractor_available() {
+                if let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() {
+                    provider.focus = FormFocus::Fields;
+                }
+                return Some(Action::None);
+            }
+            return match key.code {
+                KeyCode::Enter => Some(self.open_usage_query_script_editor()),
+                _ => None,
+            };
+        }
+        if matches!(provider.focus, FormFocus::Content) {
+            if !provider.usage_query_extractor_available() {
+                if let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() {
+                    provider.focus = FormFocus::Fields;
+                }
+                return Some(Action::None);
+            }
+            return match key.code {
+                KeyCode::Enter => Some(self.open_usage_query_script_help_view()),
+                _ => None,
+            };
+        }
+
+        let editing_field = self.form.as_ref().and_then(|form| match form {
+            FormState::ProviderAdd(provider) => match provider.text_edit_target() {
+                Some(form::ProviderTextField::UsageQuery(field)) => Some(field),
+                _ => None,
+            },
+            _ => None,
+        });
+        if let Some(field) = editing_field {
+            return self.handle_usage_query_field_editing(field, key, data);
+        }
+
+        let (fields, selected) = self.prepare_usage_query_field_selection()?;
+        self.handle_usage_query_field_navigation(fields, selected, key)
+    }
+
+    fn open_usage_query_page_with_notice(&mut self) {
+        let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+            return;
+        };
+        provider.open_usage_query_page();
+
+        if self.usage_query_notice_confirmed {
+            return;
+        }
+
+        self.overlay = Overlay::Confirm(ConfirmOverlay {
+            title: texts::tui_usage_query_notice_title().to_string(),
+            message: texts::tui_usage_query_notice_message().to_string(),
+            action: ConfirmAction::UsageQueryNotice,
+        });
+    }
+
+    fn handle_usage_query_field_editing(
+        &mut self,
+        selected: form::UsageQueryField,
+        key: KeyEvent,
+        data: &UiData,
+    ) -> Option<Action> {
+        match key.code {
+            KeyCode::Esc => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return None;
+                };
+                provider.cancel_text_edit();
+                Some(Action::None)
+            }
+            KeyCode::Enter => {
+                self.commit_active_text_edit(data);
+                Some(Action::None)
+            }
+            _ => {
+                TextEditCommand::from_key(key)?;
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return None;
+                };
+                let changed = provider
+                    .usage_query_input_mut(selected)
+                    .and_then(|input| input.apply_key(key))
+                    .map(|edit| edit.changed)
+                    .unwrap_or(false);
+                if changed {
+                    provider.clear_usage_query_field_error(selected);
+                }
+                provider.sync_usage_query_field_index(selected);
+                Some(Action::None)
+            }
+        }
+    }
+
+    fn handle_usage_query_field_navigation(
+        &mut self,
+        fields: Vec<form::UsageQueryField>,
+        selected: form::UsageQueryField,
+        key: KeyEvent,
+    ) -> Option<Action> {
+        match key.code {
+            KeyCode::Esc => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return None;
+                };
+                provider.close_usage_query_page();
+                Some(Action::None)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return None;
+                };
+                provider.usage_query_field_idx = provider.usage_query_field_idx.saturating_sub(1);
+                Some(Action::None)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return None;
+                };
+                provider.usage_query_field_idx =
+                    (provider.usage_query_field_idx + 1).min(fields.len() - 1);
+                Some(Action::None)
+            }
+            KeyCode::Char(' ') | KeyCode::Enter => {
+                Some(self.handle_usage_query_field_activate(selected, key))
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_usage_query_field_activate(
+        &mut self,
+        selected: form::UsageQueryField,
+        key: KeyEvent,
+    ) -> Action {
+        match selected {
+            form::UsageQueryField::Enabled => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return Action::None;
+                };
+                provider.toggle_usage_query_enabled();
+                Action::None
+            }
+            form::UsageQueryField::Template => {
+                if !matches!(key.code, KeyCode::Enter) {
+                    return Action::None;
+                }
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_ref() else {
+                    return Action::None;
+                };
+                let options = provider.available_usage_query_templates();
+                let selected = options
+                    .iter()
+                    .position(|template| *template == provider.usage_query_template)
+                    .unwrap_or(0);
+                self.overlay = Overlay::UsageQueryTemplatePicker { selected };
+                Action::None
+            }
+            form::UsageQueryField::CodingPlanProvider => {
+                if !matches!(key.code, KeyCode::Enter) {
+                    return Action::None;
+                }
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return Action::None;
+                };
+                provider.cycle_usage_query_coding_plan_provider();
+                Action::None
+            }
+            form::UsageQueryField::Script => {
+                if matches!(key.code, KeyCode::Enter) {
+                    self.open_usage_query_script_editor()
+                } else {
+                    Action::None
+                }
+            }
+            _ => {
+                if !matches!(key.code, KeyCode::Enter) {
+                    return Action::None;
+                }
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return Action::None;
+                };
+                provider.begin_usage_query_text_edit(selected);
+                Action::None
+            }
+        }
+    }
+
+    fn open_usage_query_script_editor(&mut self) -> Action {
+        let Some(FormState::ProviderAdd(provider)) = self.form.as_ref() else {
+            return Action::None;
+        };
+        if !provider.usage_query_extractor_available() {
+            return Action::None;
+        }
+        self.open_editor(
+            texts::tui_usage_query_script(),
+            EditorKind::Plain,
+            provider.usage_query_code.clone(),
+            EditorSubmit::ProviderFormApplyUsageScriptCode,
+        );
+        Action::None
+    }
+
+    fn open_usage_query_script_help_view(&mut self) -> Action {
+        self.overlay = Overlay::TextView(TextViewState {
+            title: texts::tui_usage_query_script_help_title().to_string(),
+            lines: form::ProviderAddFormState::usage_query_script_help_lines(),
+            scroll: 0,
+            action: None,
+        });
+        Action::None
+    }
+
+    pub(crate) fn build_hermes_models_fetch_action(&mut self) -> Action {
+        let Some(FormState::ProviderAdd(provider)) = self.form.as_ref() else {
+            return Action::None;
+        };
+        let base_url = provider.hermes_base_url.value.trim();
+        let api_key = provider.hermes_api_key.value.trim();
+        let missing_message = match (base_url.is_empty(), api_key.is_empty()) {
+            (true, true) => Some(texts::tui_model_fetch_need_config()),
+            (true, false) => Some(texts::tui_model_fetch_need_endpoint()),
+            (false, true) => Some(texts::tui_model_fetch_need_api_key()),
+            (false, false) => None,
+        };
+        if let Some(message) = missing_message {
+            self.push_toast(message, ToastKind::Warning);
+            return Action::None;
+        }
+
+        Action::ProviderModelFetch {
+            base_url: provider.hermes_base_url.value.clone(),
+            is_full_url: false,
+            api_key: Some(provider.hermes_api_key.value.clone()),
+            custom_user_agent: (!provider.custom_user_agent.value.trim().is_empty())
+                .then(|| provider.custom_user_agent.value.clone()),
+            codex_oauth: false,
+            codex_oauth_account_id: None,
+            field: ProviderAddField::HermesModels,
+            claude_idx: None,
+        }
+    }
+
+    fn handle_provider_model_field_activate(
+        &mut self,
+        selected: ProviderAddField,
+        key: KeyEvent,
+    ) -> Action {
+        let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+            return Action::None;
+        };
+
+        if matches!(key.code, KeyCode::Enter) {
+            provider.begin_main_text_edit(selected);
+            Action::None
+        } else {
+            Action::None
+        }
+    }
+
+    fn handle_provider_model_fetch(&mut self, selected: ProviderAddField) -> Action {
+        let Some(FormState::ProviderAdd(provider)) = self.form.as_ref() else {
+            return Action::None;
+        };
+        let api_key = match selected {
+            ProviderAddField::CodexModel => (!provider.codex_api_key.value.trim().is_empty())
+                .then(|| provider.codex_api_key.value.clone()),
+            ProviderAddField::GeminiModel => (!provider.gemini_api_key.value.trim().is_empty())
+                .then(|| provider.gemini_api_key.value.clone()),
+            ProviderAddField::OpenCodeModelId => {
+                (!provider.opencode_api_key.value.trim().is_empty())
+                    .then(|| provider.opencode_api_key.value.clone())
+            }
+            ProviderAddField::HermesModels => (!provider.hermes_api_key.value.trim().is_empty())
+                .then(|| provider.hermes_api_key.value.clone()),
+            _ => None,
+        };
+        let base_url = match selected {
+            ProviderAddField::CodexModel => provider.codex_base_url.value.clone(),
+            ProviderAddField::GeminiModel => provider.gemini_base_url.value.clone(),
+            ProviderAddField::OpenCodeModelId => provider.opencode_base_url.value.clone(),
+            ProviderAddField::HermesModels => provider.hermes_base_url.value.clone(),
+            _ => String::new(),
+        };
+        Action::ProviderModelFetch {
+            base_url,
+            is_full_url: provider.is_full_url && matches!(selected, ProviderAddField::CodexModel),
+            api_key,
+            custom_user_agent: (!provider.custom_user_agent.value.trim().is_empty())
+                .then(|| provider.custom_user_agent.value.clone()),
+            codex_oauth: false,
+            codex_oauth_account_id: None,
+            field: selected,
+            claude_idx: None,
+        }
+    }
+
+    fn handle_provider_json_preview_key(&mut self, key: KeyEvent, data: &UiData) -> Option<Action> {
+        let Some(FormState::ProviderAdd(provider)) = self.form.as_ref() else {
+            return None;
+        };
+
+        if matches!(provider.app_type, AppType::Codex) {
+            self.handle_codex_provider_preview_key(key, data)
+        } else {
+            self.handle_regular_provider_preview_key(key, data)
+        }
+    }
+
+    fn handle_codex_provider_preview_key(
+        &mut self,
+        key: KeyEvent,
+        data: &UiData,
+    ) -> Option<Action> {
+        match key.code {
+            KeyCode::Enter => Some(self.open_codex_provider_preview_editor(data)),
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.adjust_codex_preview_scroll(|scroll| scroll.saturating_sub(1));
+                Some(Action::None)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.adjust_codex_preview_scroll(|scroll| scroll.saturating_add(1));
+                Some(Action::None)
+            }
+            KeyCode::PageUp => {
+                self.adjust_codex_preview_scroll(|scroll| scroll.saturating_sub(10));
+                Some(Action::None)
+            }
+            KeyCode::PageDown => {
+                self.adjust_codex_preview_scroll(|scroll| scroll.saturating_add(10));
+                Some(Action::None)
+            }
+            _ => None,
+        }
+    }
+
+    fn open_codex_provider_preview_editor(&mut self, data: &UiData) -> Action {
+        let Some(FormState::ProviderAdd(provider)) = self.form.as_ref() else {
+            return Action::None;
+        };
+
+        match provider.codex_preview_section {
+            form::CodexPreviewSection::Auth => {
+                let provider_json = provider.to_provider_json_value();
+                let auth_value = provider_json
+                    .get("settingsConfig")
+                    .and_then(|value| value.get("auth"))
+                    .cloned()
+                    .filter(|value| value.is_object())
+                    .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+                let content =
+                    serde_json::to_string_pretty(&auth_value).unwrap_or_else(|_| "{}".to_string());
+                self.open_editor(
+                    texts::tui_codex_auth_json_title(),
+                    EditorKind::Json,
+                    content,
+                    EditorSubmit::ProviderFormApplyCodexAuth,
+                );
+            }
+            form::CodexPreviewSection::Config => {
+                let config_text = match provider
+                    .effective_codex_config_text_with_common_config(&data.config.common_snippet)
+                {
+                    Ok(config_text) => config_text,
+                    Err(err) => {
+                        self.push_toast(err, ToastKind::Error);
+                        return Action::None;
+                    }
+                };
+                self.open_editor(
+                    texts::tui_codex_config_toml_title(),
+                    EditorKind::Plain,
+                    config_text,
+                    EditorSubmit::ProviderFormApplyCodexConfigToml,
+                );
+            }
+        }
+
+        if let Some(editor) = self.editor.as_mut() {
+            editor.mode = EditorMode::Edit;
+        }
+        Action::None
+    }
+
+    fn adjust_codex_preview_scroll(&mut self, update: impl FnOnce(usize) -> usize) {
+        let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+            return;
+        };
+
+        let scroll = match provider.codex_preview_section {
+            form::CodexPreviewSection::Auth => &mut provider.codex_auth_scroll,
+            form::CodexPreviewSection::Config => &mut provider.codex_config_scroll,
+        };
+        *scroll = update(*scroll);
+    }
+
+    fn handle_regular_provider_preview_key(
+        &mut self,
+        key: KeyEvent,
+        data: &UiData,
+    ) -> Option<Action> {
+        match key.code {
+            KeyCode::Enter => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_ref() else {
+                    return None;
+                };
+                let provider_json = match provider
+                    .to_provider_json_value_with_common_config(&data.config.common_snippet)
+                {
+                    Ok(value) => value,
+                    Err(err) => {
+                        self.push_toast(err, ToastKind::Error);
+                        return Some(Action::None);
+                    }
+                };
+
+                let settings_value = provider_json
+                    .get("settingsConfig")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+                let content = serde_json::to_string_pretty(&settings_value)
+                    .unwrap_or_else(|_| "{}".to_string());
+                self.open_editor(
+                    texts::tui_form_json_title(),
+                    EditorKind::Json,
+                    content,
+                    EditorSubmit::ProviderFormApplyJson,
+                );
+                if let Some(editor) = self.editor.as_mut() {
+                    editor.mode = EditorMode::Edit;
+                }
+                Some(Action::None)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return None;
+                };
+                provider.json_scroll = provider.json_scroll.saturating_sub(1);
+                Some(Action::None)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return None;
+                };
+                provider.json_scroll = provider.json_scroll.saturating_add(1);
+                Some(Action::None)
+            }
+            KeyCode::PageUp => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return None;
+                };
+                provider.json_scroll = provider.json_scroll.saturating_sub(10);
+                Some(Action::None)
+            }
+            KeyCode::PageDown => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return None;
+                };
+                provider.json_scroll = provider.json_scroll.saturating_add(10);
+                Some(Action::None)
+            }
+            _ => None,
+        }
+    }
+
+    fn prepare_provider_field_selection(
+        &mut self,
+    ) -> Option<(Vec<ProviderAddField>, ProviderAddField)> {
+        let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+            return None;
+        };
+        if provider.focus != FormFocus::Fields {
+            return None;
+        }
+
+        let fields = provider.fields();
+        if !fields.is_empty() {
+            provider.field_idx = provider.field_idx.min(fields.len() - 1);
+        } else {
+            provider.field_idx = 0;
+        }
+
+        if is_provider_divider_field(fields.get(provider.field_idx)) {
+            if provider.field_idx < fields.len().saturating_sub(1) {
+                provider.field_idx = (provider.field_idx + 1).min(fields.len() - 1);
+            } else {
+                provider.field_idx = provider.field_idx.saturating_sub(1);
+            }
+        }
+
+        let selected = fields.get(provider.field_idx).copied()?;
+        Some((fields, selected))
+    }
+
+    fn prepare_usage_query_field_selection(
+        &mut self,
+    ) -> Option<(Vec<form::UsageQueryField>, form::UsageQueryField)> {
+        let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+            return None;
+        };
+        if !matches!(provider.page, form::ProviderFormPage::UsageQuery) {
+            return None;
+        }
+        if !matches!(provider.focus, FormFocus::Fields) {
+            return None;
+        }
+
+        let fields = provider.usage_query_table_fields();
+        if !fields.is_empty() {
+            provider.usage_query_field_idx = provider.usage_query_field_idx.min(fields.len() - 1);
+        } else {
+            provider.usage_query_field_idx = 0;
+        }
+
+        let selected = fields.get(provider.usage_query_field_idx).copied()?;
+        Some((fields, selected))
+    }
+
+    fn prepare_codex_local_routing_field_selection(
+        &mut self,
+    ) -> Option<(
+        Vec<form::CodexLocalRoutingField>,
+        form::CodexLocalRoutingField,
+    )> {
+        let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+            return None;
+        };
+        if !matches!(provider.page, form::ProviderFormPage::CodexLocalRouting) {
+            return None;
+        }
+        if !matches!(provider.focus, FormFocus::Fields) {
+            return None;
+        }
+
+        let fields = provider.codex_local_routing_fields();
+        if !fields.is_empty() {
+            provider.codex_local_routing_field_idx =
+                provider.codex_local_routing_field_idx.min(fields.len() - 1);
+        } else {
+            provider.codex_local_routing_field_idx = 0;
+        }
+
+        let selected = provider.selected_codex_local_routing_field()?;
+        Some((fields, selected))
+    }
+
+    fn prepare_local_proxy_settings_field_selection(
+        &mut self,
+    ) -> Option<form::LocalProxySettingsField> {
+        let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+            return None;
+        };
+        if !matches!(provider.page, form::ProviderFormPage::LocalProxySettings)
+            || !matches!(provider.focus, FormFocus::Fields)
+        {
+            return None;
+        }
+
+        provider.local_proxy_settings_field_idx = provider.local_proxy_settings_field_idx.min(
+            provider
+                .local_proxy_settings_fields()
+                .len()
+                .saturating_sub(1),
+        );
+        provider.selected_local_proxy_settings_field()
+    }
+
+    pub(super) fn finish_provider_input_change(
+        &mut self,
+        selected: ProviderAddField,
+        changed: bool,
+        data: &UiData,
+    ) {
+        let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+            return;
+        };
+
+        if changed && selected == ProviderAddField::Id {
+            provider.id_is_manual = true;
+        }
+        if changed && selected == ProviderAddField::Name && !provider.id_is_manual {
+            let existing_ids = data.existing_provider_ids();
+            provider.id.set(
+                crate::cli::commands::provider_input::generate_provider_id_for_app(
+                    &provider.app_type,
+                    provider.name.value.trim(),
+                    &existing_ids,
+                ),
+            );
+        }
+        if changed && usage_query_provider_credential_field(selected) {
+            provider.refresh_usage_query_provider_kind();
+            provider.refresh_usage_query_custom_variable_comment();
+        }
+        // The fallback model lives outside the model-mapping sub-page, so editing it
+        // here must still mark the model config touched to persist ANTHROPIC_MODEL.
+        if changed && selected == ProviderAddField::ClaudeFallbackModel {
+            provider.mark_claude_fallback_model_touched();
+        }
+
+        if let Some(message) = validate_provider_inline_field(provider, selected) {
+            provider.set_main_field_error(selected, message);
+        } else {
+            provider.clear_main_field_error(selected);
+        }
+    }
+}
+
+pub(super) fn validate_provider_inline_field(
+    provider: &form::ProviderAddFormState,
+    field: ProviderAddField,
+) -> Option<String> {
+    match field {
+        ProviderAddField::Name if provider.name.is_blank() => Some(
+            if provider.mode.is_edit() {
+                texts::tui_toast_provider_missing_name()
+            } else {
+                texts::tui_toast_provider_add_missing_fields()
+            }
+            .to_string(),
+        ),
+        ProviderAddField::Id
+            if ProviderService::is_provider_key_app(&provider.app_type)
+                && (provider.id.is_blank()
+                    || ProviderService::validate_provider_key_for_add(
+                        &provider.app_type,
+                        provider.id.value.as_str(),
+                    )
+                    .is_err()) =>
+        {
+            Some(texts::tui_hermes_provider_key_invalid().to_string())
+        }
+        ProviderAddField::HermesRateLimitDelay
+            if !is_valid_hermes_rate_limit_delay(&provider.hermes_rate_limit_delay.value) =>
+        {
+            Some(texts::tui_hermes_rate_limit_delay_invalid().to_string())
+        }
+        ProviderAddField::HermesBaseUrl => {
+            validate_hermes_base_url(&provider.hermes_base_url.value).map(str::to_string)
+        }
+        ProviderAddField::CodexBaseUrl
+            if matches!(provider.app_type, AppType::Codex)
+                && !provider.is_codex_official_provider()
+                && provider.codex_base_url.is_blank() =>
+        {
+            Some(texts::base_url_empty_error().to_string())
+        }
+        ProviderAddField::CodexMaxOutputTokens
+            if !is_valid_codex_max_output_tokens(&provider.codex_max_output_tokens.value) =>
+        {
+            Some(texts::tui_codex_max_output_tokens_invalid().to_string())
+        }
+        _ => None,
+    }
+}
+
+fn usage_query_provider_credential_field(field: ProviderAddField) -> bool {
+    matches!(
+        field,
+        ProviderAddField::ClaudeApiKey
+            | ProviderAddField::ClaudeBaseUrl
+            | ProviderAddField::CodexOAuthAccount
+            | ProviderAddField::CodexApiKey
+            | ProviderAddField::CodexBaseUrl
+            | ProviderAddField::GeminiApiKey
+            | ProviderAddField::GeminiBaseUrl
+            | ProviderAddField::HermesApiKey
+            | ProviderAddField::HermesBaseUrl
+            | ProviderAddField::OpenCodeApiKey
+            | ProviderAddField::OpenCodeBaseUrl
+    )
+}
+
+fn sanitize_provider_key_char(ch: char) -> Option<char> {
+    ProviderService::sanitize_provider_key_text(&ch.to_string())
+        .chars()
+        .next()
+}
+
+fn sanitize_number_char(ch: char) -> Option<char> {
+    (ch.is_ascii_digit() || ch == '.').then_some(ch)
+}
+
+fn sanitize_integer_char(ch: char) -> Option<char> {
+    ch.is_ascii_digit().then_some(ch)
+}
+
+fn provider_field_sanitize_fn(
+    app_type: &AppType,
+    selected: ProviderAddField,
+) -> Option<fn(char) -> Option<char>> {
+    match (app_type, selected) {
+        (&AppType::Hermes | &AppType::OpenClaw, ProviderAddField::Id) => {
+            Some(sanitize_provider_key_char)
+        }
+        (&AppType::Hermes, ProviderAddField::HermesRateLimitDelay) => Some(sanitize_number_char),
+        (&AppType::Codex, ProviderAddField::CodexMaxOutputTokens) => Some(sanitize_integer_char),
+        _ => None,
+    }
+}
+
+fn is_valid_codex_max_output_tokens(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.is_empty() || trimmed.parse::<u64>().is_ok_and(|value| value > 0)
+}
+
+fn is_valid_hermes_rate_limit_delay(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    trimmed
+        .parse::<f64>()
+        .is_ok_and(|value| value.is_finite() && value >= 0.0)
+}
+
+fn validate_hermes_base_url(raw: &str) -> Option<&'static str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Some(texts::tui_hermes_base_url_required());
+    }
+
+    let candidate = replace_hermes_template_tokens(trimmed);
+    let Ok(url) = Url::parse(&candidate) else {
+        return Some(texts::tui_hermes_base_url_invalid());
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return Some(texts::tui_hermes_base_url_scheme());
+    }
+    if url.host_str().is_none_or(str::is_empty) {
+        return Some(texts::tui_hermes_base_url_invalid());
+    }
+    None
+}
+
+fn replace_hermes_template_tokens(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(start) = rest.find("${") {
+        let (before, after_start) = rest.split_at(start);
+        out.push_str(before);
+        if let Some(end) = after_start.find('}') {
+            out.push_str("placeholder");
+            rest = &after_start[end + 1..];
+        } else {
+            out.push_str(after_start);
+            rest = "";
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn is_provider_divider_field(field: Option<&ProviderAddField>) -> bool {
+    matches!(
+        field,
+        Some(
+            ProviderAddField::ClaudeAdvancedDivider
+                | ProviderAddField::CodexAdvancedDivider
+                | ProviderAddField::HermesAdvancedDivider
+                | ProviderAddField::CommonConfigDivider
+                | ProviderAddField::UsageQueryDivider
+        )
+    )
+}
+
+fn next_openclaw_api_protocol(current: &str) -> &'static str {
+    let current = current.trim();
+    let protocols = &form::OPENCLAW_API_PROTOCOLS;
+    let next_idx = protocols
+        .iter()
+        .position(|candidate| *candidate == current)
+        .map(|idx| (idx + 1) % protocols.len())
+        .unwrap_or(0);
+    protocols[next_idx]
+}
+
+fn validate_usage_query_form(provider: &form::ProviderAddFormState) -> Option<&'static str> {
+    provider.usage_query_script_validation_error()
+}
+
+fn validate_local_proxy_settings_form(provider: &form::ProviderAddFormState) -> Option<String> {
+    if !provider.supports_local_proxy_settings() {
+        return None;
+    }
+
+    let headers = form::format_local_proxy_header_overrides(&provider.local_proxy_header_overrides);
+    if let Err(error) = form::parse_local_proxy_header_overrides(&headers) {
+        return Some(error);
+    }
+
+    let body = form::format_local_proxy_body_override(provider.local_proxy_body_override.as_ref());
+    form::parse_local_proxy_body_override(&body).err()
+}

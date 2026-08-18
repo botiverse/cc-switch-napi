@@ -1,0 +1,224 @@
+use std::path::PathBuf;
+use std::sync::mpsc;
+
+use crate::app_config::AppType;
+use crate::cli::i18n::texts;
+use crate::commands::workspace;
+use crate::error::AppError;
+use crate::services::McpService;
+
+use ratatui::prelude::Size;
+
+use super::super::app::visible_prompts;
+use super::super::app::{App, LoadingKind, Overlay, TextViewState, ToastKind};
+use super::super::data::{load_proxy_config, load_state, UiData};
+use super::super::form::{FormFocus, FormState};
+use super::super::runtime_systems::{ProxyReq, RequestTracker};
+
+pub(crate) fn import_mcp_from_supported_apps_with<FImport, FLoad>(
+    app: &mut App,
+    data: &mut UiData,
+    import: FImport,
+    load_data: FLoad,
+) -> Result<(), AppError>
+where
+    FImport: FnOnce() -> Result<usize, AppError>,
+    FLoad: FnOnce(&AppType) -> Result<UiData, AppError>,
+{
+    let count = import()?;
+    app.push_toast(texts::tui_toast_mcp_imported(count), ToastKind::Info);
+    *data = load_data(&app.app_type)?;
+    Ok(())
+}
+
+pub(crate) fn import_mcp_from_supported_apps(
+    app: &mut App,
+    data: &mut UiData,
+) -> Result<(), AppError> {
+    import_mcp_from_supported_apps_with(
+        app,
+        data,
+        || {
+            let state = load_state()?;
+            McpService::import_from_supported_apps(&state)
+        },
+        UiData::load,
+    )
+}
+
+pub(crate) fn open_proxy_help_overlay_with<F>(
+    app: &mut App,
+    data: &UiData,
+    load: F,
+) -> Result<(), AppError>
+where
+    F: FnOnce() -> Result<Option<crate::proxy::ProxyConfig>, AppError>,
+{
+    let proxy_config = load()?;
+    app.open_proxy_help_view(data, proxy_config.as_ref());
+    Ok(())
+}
+
+pub(crate) fn app_display_name(app_type: &AppType) -> &'static str {
+    match app_type {
+        AppType::Claude => "Claude",
+        AppType::Codex => "Codex",
+        AppType::Gemini => "Gemini",
+        AppType::OpenCode => "OpenCode",
+        AppType::Hermes => "Hermes",
+        AppType::OpenClaw => "OpenClaw",
+    }
+}
+
+pub(crate) fn queue_managed_proxy_action(
+    app: &mut App,
+    proxy_req_tx: Option<&mpsc::Sender<ProxyReq>>,
+    proxy_loading: &mut RequestTracker,
+    app_type: AppType,
+    enabled: bool,
+    base_reload_token: super::super::data::UiDataReloadToken,
+) -> Result<(), AppError> {
+    let Some(tx) = proxy_req_tx else {
+        app.push_toast(
+            texts::tui_toast_proxy_request_failed(texts::tui_error_proxy_worker_unavailable()),
+            ToastKind::Warning,
+        );
+        return Ok(());
+    };
+
+    let request_id = proxy_loading.start();
+    app.overlay = Overlay::Loading {
+        kind: LoadingKind::Proxy,
+        title: if enabled {
+            texts::tui_proxy_loading_title_start().to_string()
+        } else {
+            texts::tui_proxy_loading_title_stop().to_string()
+        },
+        message: texts::tui_loading().to_string(),
+    };
+
+    if let Err(err) = tx.send(ProxyReq::SetManagedSessionForCurrentApp {
+        request_id,
+        app_type,
+        enabled,
+        base_reload_token,
+    }) {
+        proxy_loading.cancel();
+        app.overlay = Overlay::None;
+        app.push_toast(
+            texts::tui_toast_proxy_request_failed(&err.to_string()),
+            ToastKind::Error,
+        );
+    }
+
+    Ok(())
+}
+
+pub(crate) fn run_external_editor_for_current_editor(
+    app: &mut App,
+    open_external_editor: impl FnOnce(&str) -> Result<String, AppError>,
+) -> Result<(), AppError> {
+    let Some(current_text) = app.editor.as_ref().map(|editor| editor.text()) else {
+        return Ok(());
+    };
+
+    let edited_text = open_external_editor(&current_text)?;
+    if let Some(editor) = app.editor.as_mut() {
+        editor.replace_text(edited_text);
+    }
+
+    Ok(())
+}
+
+pub(crate) fn run_external_editor_for_prompt_form_content(
+    app: &mut App,
+    open_external_editor: impl FnOnce(&str) -> Result<String, AppError>,
+) -> Result<(), AppError> {
+    let Some(current_text) = app.form.as_ref().and_then(|form| match form {
+        FormState::PromptMeta(prompt) if matches!(prompt.focus, FormFocus::Content) => {
+            Some(prompt.content.text())
+        }
+        _ => None,
+    }) else {
+        return Ok(());
+    };
+
+    let edited_text = open_external_editor(&current_text)?;
+    if let Some(FormState::PromptMeta(prompt)) = app.form.as_mut() {
+        prompt.content.replace_text(edited_text);
+        prompt.content.ensure_cursor_visible(Size {
+            width: 1,
+            height: 1,
+        });
+    }
+
+    Ok(())
+}
+
+pub(super) fn export_target(path: String) -> PathBuf {
+    PathBuf::from(path)
+}
+
+pub(super) fn refresh_openclaw_workspace_data(
+    app: &mut App,
+    data: &mut UiData,
+) -> Result<(), AppError> {
+    *data = UiData::load(&app.app_type)?;
+    refresh_openclaw_daily_memory_search_results(app)?;
+    app.clamp_selections(data);
+    Ok(())
+}
+
+pub(super) fn refresh_openclaw_daily_memory_search_results(app: &mut App) -> Result<(), AppError> {
+    let query = app.openclaw_daily_memory_search_query.trim();
+    if query.is_empty() {
+        app.openclaw_daily_memory_search_results.clear();
+        app.daily_memory_idx = 0;
+        return Ok(());
+    }
+
+    app.openclaw_daily_memory_search_results =
+        workspace::search_daily_memory_files(query.to_string()).map_err(AppError::Message)?;
+    if app.openclaw_daily_memory_search_results.is_empty() {
+        app.daily_memory_idx = 0;
+    } else {
+        app.daily_memory_idx = app
+            .daily_memory_idx
+            .min(app.openclaw_daily_memory_search_results.len() - 1);
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub(super) fn text_view(title: String, content: String) -> Overlay {
+    Overlay::TextView(TextViewState {
+        title,
+        lines: content.lines().map(|s| s.to_string()).collect(),
+        scroll: 0,
+        action: None,
+    })
+}
+
+pub(super) fn select_prompt_by_id(app: &mut App, data: &UiData, id: &str) {
+    let visible = visible_prompts(&app.filter, data);
+    if let Some(idx) = visible.iter().position(|row| row.id == id) {
+        app.prompt_idx = idx;
+        return;
+    }
+
+    if app.filter.active || !app.filter.input.value.trim().is_empty() {
+        app.filter.active = false;
+        app.filter.input.set("");
+        let visible = visible_prompts(&app.filter, data);
+        if let Some(idx) = visible.iter().position(|row| row.id == id) {
+            app.prompt_idx = idx;
+            return;
+        }
+    }
+
+    app.prompt_idx = 0;
+}
+
+pub(super) fn open_proxy_help(app: &mut App, data: &UiData) -> Result<(), AppError> {
+    open_proxy_help_overlay_with(app, data, load_proxy_config)
+}

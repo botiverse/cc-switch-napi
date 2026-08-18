@@ -1,0 +1,731 @@
+use ratatui::style::Color;
+
+use crate::app_config::AppType;
+
+const COLOR_MODE_ENV: &str = "CC_SWITCH_COLOR_MODE";
+
+const DRACULA_GREEN: (u8, u8, u8) = (80, 250, 123);
+const DRACULA_CYAN: (u8, u8, u8) = (139, 233, 253);
+const DRACULA_PINK: (u8, u8, u8) = (255, 121, 198);
+const DRACULA_ORANGE: (u8, u8, u8) = (255, 184, 108);
+const DRACULA_YELLOW: (u8, u8, u8) = (241, 250, 140);
+const DRACULA_RED: (u8, u8, u8) = (255, 85, 85);
+const OPENCLAW_CORAL: (u8, u8, u8) = (255, 79, 64);
+const DRACULA_COMMENT: (u8, u8, u8) = (98, 114, 164);
+const DRACULA_SURFACE: (u8, u8, u8) = (68, 71, 90);
+const DRACULA_FG: (u8, u8, u8) = (248, 248, 242);
+
+// Light-background palette: the same hue family, darkened for contrast
+// against white terminals.
+const LIGHT_GREEN: (u8, u8, u8) = (24, 138, 66);
+const LIGHT_CYAN: (u8, u8, u8) = (7, 122, 168);
+const LIGHT_PINK: (u8, u8, u8) = (186, 36, 120);
+const LIGHT_ORANGE: (u8, u8, u8) = (182, 98, 16);
+const LIGHT_YELLOW: (u8, u8, u8) = (146, 124, 8);
+const LIGHT_RED: (u8, u8, u8) = (190, 36, 36);
+const LIGHT_CORAL: (u8, u8, u8) = (196, 54, 40);
+const LIGHT_COMMENT: (u8, u8, u8) = (92, 102, 140);
+const LIGHT_DIM: (u8, u8, u8) = (164, 170, 190);
+const LIGHT_SURFACE: (u8, u8, u8) = (222, 225, 236);
+const LIGHT_FG: (u8, u8, u8) = (40, 42, 54);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorMode {
+    NoColor,
+    TrueColor,
+    Ansi256,
+}
+
+/// User-selectable appearance. `Auto` infers the terminal background from
+/// COLORFGBG and falls back to dark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThemeMode {
+    #[default]
+    Auto,
+    Dark,
+    Light,
+}
+
+impl ThemeMode {
+    pub fn code(&self) -> &'static str {
+        match self {
+            ThemeMode::Auto => "auto",
+            ThemeMode::Dark => "dark",
+            ThemeMode::Light => "light",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(ThemeMode::Auto),
+            "dark" => Some(ThemeMode::Dark),
+            "light" => Some(ThemeMode::Light),
+            _ => None,
+        }
+    }
+
+    pub fn next(&self) -> Self {
+        match self {
+            ThemeMode::Auto => ThemeMode::Dark,
+            ThemeMode::Dark => ThemeMode::Light,
+            ThemeMode::Light => ThemeMode::Auto,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Theme {
+    pub accent: Color,
+    pub ok: Color,
+    pub warn: Color,
+    pub err: Color,
+    pub dim: Color,
+    /// Muted text / secondary info (Dracula comment #6272a4)
+    pub comment: Color,
+    /// Highlighted values (Dracula cyan #8be9fd)
+    pub cyan: Color,
+    /// Subtle background / surface (Dracula current-line #44475a)
+    pub surface: Color,
+    /// Strong foreground for emphasized text and text on `surface`.
+    pub fg_strong: Color,
+    /// Foreground for text sitting on a `comment` background; the comment
+    /// blue stays mid-dark in both palettes, so this is always light.
+    pub on_comment: Color,
+    /// Foreground for text sitting on an accent background.
+    pub on_accent: Color,
+    pub no_color: bool,
+    color_mode: ColorMode,
+}
+
+impl Theme {
+    /// Quantize an arbitrary RGB triple through the active color mode.
+    ///
+    /// Widgets that carry their own ramp (the usage chart series palette)
+    /// route through this so they degrade the same way the palette fields do
+    /// instead of hard-coding truecolor.
+    pub fn shade(&self, rgb: (u8, u8, u8)) -> Color {
+        terminal_color(self.color_mode, rgb)
+    }
+}
+
+pub fn no_color() -> bool {
+    std::env::var_os("NO_COLOR").is_some()
+}
+
+fn parse_color_mode(value: &str) -> Option<ColorMode> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "" | "auto" => None,
+        "none" | "no-color" => Some(ColorMode::NoColor),
+        "rgb" | "truecolor" | "24bit" | "24-bit" => Some(ColorMode::TrueColor),
+        "ansi256" | "ansi-256" | "256" | "256color" | "256-color" => Some(ColorMode::Ansi256),
+        _ => None,
+    }
+}
+
+fn color_mode_override() -> Option<ColorMode> {
+    parse_color_mode(&std::env::var(COLOR_MODE_ENV).ok()?)
+}
+
+fn env_supports_truecolor(key: &str) -> bool {
+    std::env::var(key)
+        .map(|value| {
+            let normalized = value.to_ascii_lowercase();
+            normalized.contains("truecolor")
+                || normalized.contains("24bit")
+                || normalized.contains("24-bit")
+                || normalized.contains("-direct")
+                || normalized.ends_with("direct")
+        })
+        .unwrap_or(false)
+}
+
+fn known_ansi256_terminal() -> bool {
+    std::env::var("TERM_PROGRAM")
+        .map(|value| value == "Apple_Terminal")
+        .unwrap_or(false)
+}
+
+fn plain_xterm_prefers_ansi256() -> bool {
+    std::env::var("TERM")
+        .map(|value| value.eq_ignore_ascii_case("xterm"))
+        .unwrap_or(false)
+}
+
+fn detected_color_mode() -> ColorMode {
+    if no_color() {
+        return ColorMode::NoColor;
+    }
+
+    if let Some(mode) = color_mode_override() {
+        return mode;
+    }
+
+    if known_ansi256_terminal() {
+        return ColorMode::Ansi256;
+    }
+
+    if env_supports_truecolor("COLORTERM") || env_supports_truecolor("TERM") {
+        return ColorMode::TrueColor;
+    }
+
+    if plain_xterm_prefers_ansi256() {
+        return ColorMode::Ansi256;
+    }
+
+    ColorMode::TrueColor
+}
+
+fn cube_index(value: u8) -> u8 {
+    match value {
+        0..=47 => 0,
+        48..=114 => 1,
+        _ => ((value - 35) / 40).min(5),
+    }
+}
+
+fn cube_level(index: u8) -> u8 {
+    [0, 95, 135, 175, 215, 255][index as usize]
+}
+
+fn ansi256_cube(r: u8, g: u8, b: u8) -> (u8, u8, u8, u8) {
+    let ri = cube_index(r);
+    let gi = cube_index(g);
+    let bi = cube_index(b);
+    (
+        16 + (36 * ri) + (6 * gi) + bi,
+        cube_level(ri),
+        cube_level(gi),
+        cube_level(bi),
+    )
+}
+
+fn ansi256_gray(r: u8, g: u8, b: u8) -> (u8, u8, u8, u8) {
+    let avg = ((r as u16 + g as u16 + b as u16) / 3) as u8;
+    let index = if avg <= 8 {
+        0
+    } else if avg >= 238 {
+        23
+    } else {
+        (((avg as u16 - 8 + 5) / 10) as u8).min(23)
+    };
+    let level = 8 + index * 10;
+    (232 + index, level, level, level)
+}
+
+fn color_distance_sq(lhs: (u8, u8, u8), rhs: (u8, u8, u8)) -> u32 {
+    let dr = lhs.0 as i32 - rhs.0 as i32;
+    let dg = lhs.1 as i32 - rhs.1 as i32;
+    let db = lhs.2 as i32 - rhs.2 as i32;
+    (dr * dr + dg * dg + db * db) as u32
+}
+
+fn rgb_to_ansi256(r: u8, g: u8, b: u8) -> u8 {
+    let source = (r, g, b);
+    let cube = ansi256_cube(r, g, b);
+    let gray = ansi256_gray(r, g, b);
+
+    let cube_distance = color_distance_sq(source, (cube.1, cube.2, cube.3));
+    let gray_distance = color_distance_sq(source, (gray.1, gray.2, gray.3));
+
+    if cube_distance <= gray_distance {
+        cube.0
+    } else {
+        gray.0
+    }
+}
+
+fn terminal_color(color_mode: ColorMode, rgb: (u8, u8, u8)) -> Color {
+    match color_mode {
+        ColorMode::NoColor => Color::Reset,
+        ColorMode::TrueColor => Color::Rgb(rgb.0, rgb.1, rgb.2),
+        ColorMode::Ansi256 => Color::Indexed(rgb_to_ansi256(rgb.0, rgb.1, rgb.2)),
+    }
+}
+
+fn accent_rgb(app: &AppType, light: bool) -> (u8, u8, u8) {
+    if light {
+        return match app {
+            AppType::Codex => LIGHT_GREEN,
+            AppType::Claude => LIGHT_CYAN,
+            AppType::Gemini => LIGHT_PINK,
+            AppType::OpenCode => LIGHT_ORANGE,
+            AppType::Hermes => LIGHT_YELLOW,
+            AppType::OpenClaw => LIGHT_CORAL,
+        };
+    }
+
+    match app {
+        AppType::Codex => DRACULA_GREEN,
+        AppType::Claude => DRACULA_CYAN,
+        AppType::Gemini => DRACULA_PINK,
+        AppType::OpenCode => DRACULA_ORANGE,
+        AppType::Hermes => DRACULA_YELLOW,
+        AppType::OpenClaw => OPENCLAW_CORAL,
+    }
+}
+
+/// Infer light/dark from COLORFGBG ("fg;bg", bg 7 or 15 = light). Absent
+/// or unparsable values fall back to dark, the historical default.
+fn terminal_background_is_light() -> bool {
+    std::env::var("COLORFGBG")
+        .ok()
+        .and_then(|value| {
+            value
+                .rsplit(';')
+                .next()
+                .and_then(|bg| bg.trim().parse::<u8>().ok())
+        })
+        .is_some_and(|bg| bg == 7 || bg == 15)
+}
+
+pub fn configured_theme_mode() -> ThemeMode {
+    crate::settings::get_theme_mode()
+        .as_deref()
+        .and_then(ThemeMode::parse)
+        .unwrap_or_default()
+}
+
+fn resolved_light(mode: ThemeMode) -> bool {
+    match mode {
+        ThemeMode::Dark => false,
+        ThemeMode::Light => true,
+        ThemeMode::Auto => terminal_background_is_light(),
+    }
+}
+
+pub fn theme_for(app: &AppType) -> Theme {
+    theme_for_mode(app, configured_theme_mode())
+}
+
+pub fn theme_for_mode(app: &AppType, mode: ThemeMode) -> Theme {
+    let color_mode = detected_color_mode();
+    let no_color = matches!(color_mode, ColorMode::NoColor);
+    let light = resolved_light(mode);
+
+    let (ok, warn, err, dim, comment, cyan, surface, fg_strong) = if light {
+        (
+            LIGHT_GREEN,
+            LIGHT_YELLOW,
+            LIGHT_RED,
+            LIGHT_DIM,
+            LIGHT_COMMENT,
+            LIGHT_CYAN,
+            LIGHT_SURFACE,
+            LIGHT_FG,
+        )
+    } else {
+        (
+            DRACULA_GREEN,
+            DRACULA_YELLOW,
+            DRACULA_RED,
+            DRACULA_COMMENT,
+            DRACULA_COMMENT,
+            DRACULA_CYAN,
+            DRACULA_SURFACE,
+            DRACULA_FG,
+        )
+    };
+
+    Theme {
+        accent: terminal_color(color_mode, accent_rgb(app, light)),
+        ok: terminal_color(color_mode, ok),
+        warn: terminal_color(color_mode, warn),
+        err: terminal_color(color_mode, err),
+        dim: terminal_color(color_mode, dim),
+        comment: terminal_color(color_mode, comment),
+        cyan: terminal_color(color_mode, cyan),
+        surface: terminal_color(color_mode, surface),
+        fg_strong: terminal_color(color_mode, fg_strong),
+        on_comment: terminal_color(color_mode, (255, 255, 255)),
+        // Light-mode accents are dark enough to carry white text; the
+        // bright Dracula accents need dark text.
+        on_accent: terminal_color(
+            color_mode,
+            if light { (255, 255, 255) } else { (10, 10, 10) },
+        ),
+        no_color,
+        color_mode,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn theme_mode_codes_round_trip() {
+        for mode in [ThemeMode::Auto, ThemeMode::Dark, ThemeMode::Light] {
+            assert_eq!(ThemeMode::parse(mode.code()), Some(mode));
+        }
+        assert_eq!(ThemeMode::parse(" Dark "), Some(ThemeMode::Dark));
+        assert_eq!(ThemeMode::parse("solarized"), None);
+    }
+
+    #[test]
+    fn theme_mode_cycles_through_all_variants() {
+        let start = ThemeMode::Auto;
+        assert_eq!(start.next(), ThemeMode::Dark);
+        assert_eq!(start.next().next(), ThemeMode::Light);
+        assert_eq!(start.next().next().next(), ThemeMode::Auto);
+    }
+
+    #[test]
+    fn light_and_dark_palettes_differ() {
+        let _guard = env_lock().lock().unwrap();
+        let dark = theme_for_mode(&AppType::Claude, ThemeMode::Dark);
+        let light = theme_for_mode(&AppType::Claude, ThemeMode::Light);
+        assert_ne!(dark.accent, light.accent);
+        assert_ne!(dark.fg_strong, light.fg_strong);
+        assert_ne!(dark.surface, light.surface);
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(value) = self.previous.take() {
+                unsafe { std::env::set_var(self.key, value) };
+            } else {
+                unsafe { std::env::remove_var(self.key) };
+            }
+        }
+    }
+
+    #[test]
+    fn opencode_theme_uses_distinct_accent_from_codex() {
+        let _lock = env_lock().lock().expect("env lock poisoned");
+        let _no_color = EnvGuard::remove("NO_COLOR");
+        let _color_mode = EnvGuard::remove(COLOR_MODE_ENV);
+        let _colorterm = EnvGuard::remove("COLORTERM");
+        let _term = EnvGuard::remove("TERM");
+
+        let opencode = theme_for(&AppType::OpenCode);
+        let codex = theme_for(&AppType::Codex);
+
+        assert_ne!(opencode.accent, codex.accent);
+    }
+
+    #[test]
+    fn openclaw_theme_uses_distinct_upstream_aligned_accent() {
+        let _lock = env_lock().lock().expect("env lock poisoned");
+        let _no_color = EnvGuard::remove("NO_COLOR");
+        let _color_mode = EnvGuard::remove(COLOR_MODE_ENV);
+        let _colorterm = EnvGuard::set("COLORTERM", "truecolor");
+        let _term = EnvGuard::set("TERM", "xterm-256color");
+
+        let openclaw = theme_for(&AppType::OpenClaw);
+        let opencode = theme_for(&AppType::OpenCode);
+        let codex = theme_for(&AppType::Codex);
+
+        assert_eq!(openclaw.accent, Color::Rgb(255, 79, 64));
+        assert_ne!(openclaw.accent, opencode.accent);
+        assert_ne!(openclaw.accent, codex.accent);
+    }
+
+    #[test]
+    fn theme_keeps_rgb_colors_when_truecolor_is_available() {
+        let _lock = env_lock().lock().expect("env lock poisoned");
+        let _no_color = EnvGuard::remove("NO_COLOR");
+        let _color_mode = EnvGuard::remove("CC_SWITCH_COLOR_MODE");
+        let _colorterm = EnvGuard::set("COLORTERM", "truecolor");
+        let _term = EnvGuard::set("TERM", "xterm-256color");
+
+        let theme = theme_for(&AppType::Claude);
+
+        assert_eq!(detected_color_mode(), ColorMode::TrueColor);
+        assert_eq!(theme.accent, Color::Rgb(139, 233, 253));
+        assert_eq!(theme.surface, Color::Rgb(68, 71, 90));
+        assert!(!theme.no_color);
+    }
+
+    #[test]
+    fn theme_defaults_to_rgb_when_terminal_capability_is_unknown() {
+        let _lock = env_lock().lock().expect("env lock poisoned");
+        let _no_color = EnvGuard::remove("NO_COLOR");
+        let _color_mode = EnvGuard::remove("CC_SWITCH_COLOR_MODE");
+        let _colorterm = EnvGuard::remove("COLORTERM");
+        let _term = EnvGuard::remove("TERM");
+        let _term_program = EnvGuard::remove("TERM_PROGRAM");
+
+        let theme = theme_for(&AppType::OpenCode);
+
+        assert_eq!(detected_color_mode(), ColorMode::TrueColor);
+        assert_eq!(theme.accent, Color::Rgb(255, 184, 108));
+        assert_eq!(theme.surface, Color::Rgb(68, 71, 90));
+        assert!(!theme.no_color);
+    }
+
+    #[test]
+    fn theme_keeps_truecolor_when_term_advertises_xterm_256color_without_negative_signals() {
+        let _lock = env_lock().lock().expect("env lock poisoned");
+        let _no_color = EnvGuard::remove("NO_COLOR");
+        let _color_mode = EnvGuard::remove("CC_SWITCH_COLOR_MODE");
+        let _colorterm = EnvGuard::remove("COLORTERM");
+        let _term = EnvGuard::set("TERM", "xterm-256color");
+        let _term_program = EnvGuard::remove("TERM_PROGRAM");
+
+        let theme = theme_for(&AppType::Claude);
+
+        assert_eq!(detected_color_mode(), ColorMode::TrueColor);
+        assert_eq!(theme.accent, Color::Rgb(139, 233, 253));
+        assert_eq!(theme.surface, Color::Rgb(68, 71, 90));
+        assert!(!theme.no_color);
+    }
+
+    #[test]
+    fn theme_keeps_truecolor_for_termius_without_explicit_truecolor_signal() {
+        let _lock = env_lock().lock().expect("env lock poisoned");
+        let _no_color = EnvGuard::remove("NO_COLOR");
+        let _color_mode = EnvGuard::remove("CC_SWITCH_COLOR_MODE");
+        let _colorterm = EnvGuard::remove("COLORTERM");
+        let _term = EnvGuard::set("TERM", "xterm-256color");
+        let _term_program = EnvGuard::set("TERM_PROGRAM", "Termius");
+
+        let theme = theme_for(&AppType::Claude);
+
+        assert_eq!(detected_color_mode(), ColorMode::TrueColor);
+        assert_eq!(theme.accent, Color::Rgb(139, 233, 253));
+        assert_eq!(theme.surface, Color::Rgb(68, 71, 90));
+        assert!(!theme.no_color);
+    }
+
+    #[test]
+    fn theme_keeps_truecolor_when_term_advertises_tmux_256color_without_negative_signals() {
+        let _lock = env_lock().lock().expect("env lock poisoned");
+        let _no_color = EnvGuard::remove("NO_COLOR");
+        let _color_mode = EnvGuard::remove("CC_SWITCH_COLOR_MODE");
+        let _colorterm = EnvGuard::remove("COLORTERM");
+        let _term = EnvGuard::set("TERM", "tmux-256color");
+        let _term_program = EnvGuard::remove("TERM_PROGRAM");
+
+        let theme = theme_for(&AppType::Claude);
+
+        assert_eq!(detected_color_mode(), ColorMode::TrueColor);
+        assert_eq!(theme.accent, Color::Rgb(139, 233, 253));
+        assert_eq!(theme.surface, Color::Rgb(68, 71, 90));
+        assert!(!theme.no_color);
+    }
+
+    #[test]
+    fn theme_uses_ansi256_for_plain_xterm_over_ssh_without_truecolor_signal() {
+        let _lock = env_lock().lock().expect("env lock poisoned");
+        let _no_color = EnvGuard::remove("NO_COLOR");
+        let _color_mode = EnvGuard::remove("CC_SWITCH_COLOR_MODE");
+        let _colorterm = EnvGuard::remove("COLORTERM");
+        let _term = EnvGuard::set("TERM", "xterm");
+        let _term_program = EnvGuard::remove("TERM_PROGRAM");
+        let _ssh_tty = EnvGuard::set("SSH_TTY", "/dev/pts/0");
+
+        let theme = theme_for(&AppType::Claude);
+
+        assert_eq!(detected_color_mode(), ColorMode::Ansi256);
+        assert_eq!(theme.accent, Color::Indexed(rgb_to_ansi256(139, 233, 253)));
+        assert_eq!(theme.surface, Color::Indexed(rgb_to_ansi256(68, 71, 90)));
+        assert!(!theme.no_color);
+    }
+
+    #[test]
+    fn theme_uses_ansi256_for_plain_xterm_without_truecolor_signal() {
+        let _lock = env_lock().lock().expect("env lock poisoned");
+        let _no_color = EnvGuard::remove("NO_COLOR");
+        let _color_mode = EnvGuard::remove("CC_SWITCH_COLOR_MODE");
+        let _colorterm = EnvGuard::remove("COLORTERM");
+        let _term = EnvGuard::set("TERM", "xterm");
+        let _term_program = EnvGuard::remove("TERM_PROGRAM");
+        let _ssh_tty = EnvGuard::remove("SSH_TTY");
+
+        let theme = theme_for(&AppType::Claude);
+
+        assert_eq!(detected_color_mode(), ColorMode::Ansi256);
+        assert_eq!(theme.accent, Color::Indexed(rgb_to_ansi256(139, 233, 253)));
+        assert_eq!(theme.surface, Color::Indexed(rgb_to_ansi256(68, 71, 90)));
+        assert!(!theme.no_color);
+    }
+
+    #[test]
+    fn explicit_truecolor_override_beats_plain_xterm_auto_fallback() {
+        let _lock = env_lock().lock().expect("env lock poisoned");
+        let _no_color = EnvGuard::remove("NO_COLOR");
+        let _color_mode = EnvGuard::set("CC_SWITCH_COLOR_MODE", "truecolor");
+        let _colorterm = EnvGuard::remove("COLORTERM");
+        let _term = EnvGuard::set("TERM", "xterm");
+        let _term_program = EnvGuard::remove("TERM_PROGRAM");
+        let _ssh_tty = EnvGuard::remove("SSH_TTY");
+
+        let theme = theme_for(&AppType::Claude);
+
+        assert_eq!(detected_color_mode(), ColorMode::TrueColor);
+        assert_eq!(theme.accent, Color::Rgb(139, 233, 253));
+        assert_eq!(theme.surface, Color::Rgb(68, 71, 90));
+        assert!(!theme.no_color);
+    }
+
+    #[test]
+    fn theme_keeps_truecolor_for_plain_xterm_over_ssh_with_explicit_truecolor_signal() {
+        let _lock = env_lock().lock().expect("env lock poisoned");
+        let _no_color = EnvGuard::remove("NO_COLOR");
+        let _color_mode = EnvGuard::remove("CC_SWITCH_COLOR_MODE");
+        let _colorterm = EnvGuard::set("COLORTERM", "truecolor");
+        let _term = EnvGuard::set("TERM", "xterm");
+        let _term_program = EnvGuard::remove("TERM_PROGRAM");
+        let _ssh_tty = EnvGuard::set("SSH_TTY", "/dev/pts/0");
+
+        let theme = theme_for(&AppType::Claude);
+
+        assert_eq!(detected_color_mode(), ColorMode::TrueColor);
+        assert_eq!(theme.accent, Color::Rgb(139, 233, 253));
+        assert_eq!(theme.surface, Color::Rgb(68, 71, 90));
+        assert!(!theme.no_color);
+    }
+
+    #[test]
+    fn theme_keeps_truecolor_for_term_direct_over_ssh() {
+        let _lock = env_lock().lock().expect("env lock poisoned");
+        let _no_color = EnvGuard::remove("NO_COLOR");
+        let _color_mode = EnvGuard::remove("CC_SWITCH_COLOR_MODE");
+        let _colorterm = EnvGuard::remove("COLORTERM");
+        let _term = EnvGuard::set("TERM", "xterm-direct");
+        let _term_program = EnvGuard::remove("TERM_PROGRAM");
+        let _ssh_tty = EnvGuard::set("SSH_TTY", "/dev/pts/0");
+
+        let theme = theme_for(&AppType::Claude);
+
+        assert_eq!(detected_color_mode(), ColorMode::TrueColor);
+        assert_eq!(theme.accent, Color::Rgb(139, 233, 253));
+        assert_eq!(theme.surface, Color::Rgb(68, 71, 90));
+        assert!(!theme.no_color);
+    }
+
+    #[test]
+    fn theme_uses_ansi256_when_explicitly_requested() {
+        let _lock = env_lock().lock().expect("env lock poisoned");
+        let _no_color = EnvGuard::remove("NO_COLOR");
+        let _color_mode = EnvGuard::set("CC_SWITCH_COLOR_MODE", "ansi256");
+        let _colorterm = EnvGuard::remove("COLORTERM");
+        let _term = EnvGuard::remove("TERM");
+        let _term_program = EnvGuard::remove("TERM_PROGRAM");
+
+        let theme = theme_for(&AppType::OpenCode);
+
+        assert_eq!(detected_color_mode(), ColorMode::Ansi256);
+        assert_eq!(theme.accent, Color::Indexed(215));
+        assert_eq!(theme.surface, Color::Indexed(239));
+        assert!(!theme.no_color);
+    }
+
+    #[test]
+    fn no_color_has_priority_over_explicit_color_mode() {
+        let _lock = env_lock().lock().expect("env lock poisoned");
+        let _no_color = EnvGuard::set("NO_COLOR", "1");
+        let _color_mode = EnvGuard::set("CC_SWITCH_COLOR_MODE", "truecolor");
+        let _colorterm = EnvGuard::set("COLORTERM", "truecolor");
+        let _term = EnvGuard::set("TERM", "xterm-256color");
+        let _term_program = EnvGuard::remove("TERM_PROGRAM");
+
+        let theme = theme_for(&AppType::Gemini);
+
+        assert_eq!(detected_color_mode(), ColorMode::NoColor);
+        assert_eq!(theme.accent, Color::Reset);
+        assert_eq!(theme.surface, Color::Reset);
+        assert!(theme.no_color);
+    }
+
+    #[test]
+    fn theme_uses_ansi256_in_apple_terminal_without_truecolor_signal() {
+        let _lock = env_lock().lock().expect("env lock poisoned");
+        let _no_color = EnvGuard::remove("NO_COLOR");
+        let _color_mode = EnvGuard::remove("CC_SWITCH_COLOR_MODE");
+        let _colorterm = EnvGuard::remove("COLORTERM");
+        let _term = EnvGuard::set("TERM", "xterm-256color");
+        let _term_program = EnvGuard::set("TERM_PROGRAM", "Apple_Terminal");
+
+        let theme = theme_for(&AppType::Claude);
+
+        assert_eq!(detected_color_mode(), ColorMode::Ansi256);
+        assert_eq!(theme.accent, Color::Indexed(rgb_to_ansi256(139, 233, 253)));
+        assert_eq!(theme.surface, Color::Indexed(rgb_to_ansi256(68, 71, 90)));
+        assert!(!theme.no_color);
+    }
+
+    #[test]
+    fn explicit_truecolor_override_beats_apple_terminal_auto_fallback() {
+        let _lock = env_lock().lock().expect("env lock poisoned");
+        let _no_color = EnvGuard::remove("NO_COLOR");
+        let _color_mode = EnvGuard::set("CC_SWITCH_COLOR_MODE", "truecolor");
+        let _colorterm = EnvGuard::remove("COLORTERM");
+        let _term = EnvGuard::set("TERM", "xterm-256color");
+        let _term_program = EnvGuard::set("TERM_PROGRAM", "Apple_Terminal");
+
+        let theme = theme_for(&AppType::Claude);
+
+        assert_eq!(detected_color_mode(), ColorMode::TrueColor);
+        assert_eq!(theme.accent, Color::Rgb(139, 233, 253));
+        assert_eq!(theme.surface, Color::Rgb(68, 71, 90));
+        assert!(!theme.no_color);
+    }
+
+    /// Terminals without a truecolor signal (Xshell-style, issue #60) end
+    /// up on the ansi256 path; the light palette and the new semantic
+    /// foregrounds must degrade to sensible indices there too.
+    #[test]
+    fn ansi256_mapping_keeps_curated_indices_for_light_palette() {
+        // Light accents stay chromatic and dark enough for white paper.
+        assert_eq!(rgb_to_ansi256(LIGHT_CYAN.0, LIGHT_CYAN.1, LIGHT_CYAN.2), 31);
+        // Neutral roles stay neutral: chip surface a light gray, borders a
+        // mid gray, ink a near-black.
+        assert_eq!(
+            rgb_to_ansi256(LIGHT_SURFACE.0, LIGHT_SURFACE.1, LIGHT_SURFACE.2),
+            254
+        );
+        assert_eq!(rgb_to_ansi256(LIGHT_DIM.0, LIGHT_DIM.1, LIGHT_DIM.2), 145);
+        assert_eq!(rgb_to_ansi256(LIGHT_FG.0, LIGHT_FG.1, LIGHT_FG.2), 236);
+        // Semantic foregrounds in dark mode: strong text bright, text on
+        // accent chips near-black.
+        assert_eq!(
+            rgb_to_ansi256(DRACULA_FG.0, DRACULA_FG.1, DRACULA_FG.2),
+            255
+        );
+        assert_eq!(rgb_to_ansi256(10, 10, 10), 232);
+    }
+
+    #[test]
+    fn ansi256_mapping_keeps_curated_indices_for_fixed_v5_palette() {
+        assert_eq!(rgb_to_ansi256(80, 250, 123), 84);
+        assert_eq!(rgb_to_ansi256(139, 233, 253), 117);
+        assert_eq!(rgb_to_ansi256(255, 121, 198), 212);
+        assert_eq!(rgb_to_ansi256(255, 184, 108), 215);
+        assert_eq!(rgb_to_ansi256(241, 250, 140), 228);
+        assert_eq!(rgb_to_ansi256(255, 85, 85), 203);
+        assert_eq!(rgb_to_ansi256(98, 114, 164), 61);
+        assert_eq!(rgb_to_ansi256(68, 71, 90), 239);
+        assert_eq!(rgb_to_ansi256(101, 113, 160), 61);
+        assert_eq!(rgb_to_ansi256(248, 248, 248), 231);
+        assert_eq!(rgb_to_ansi256(108, 108, 108), 242);
+        assert_eq!(rgb_to_ansi256(255, 255, 255), 231);
+    }
+}
