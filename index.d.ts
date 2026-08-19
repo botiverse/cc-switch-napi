@@ -66,6 +66,20 @@ export declare class CcSwitch {
   clearCommonConfig(app: import('./api.js').AppId): void
   /** Writes all currently selected providers back to their live configs. */
   syncCurrentToLive(): void
+  /** Starts the Codex OAuth device flow. Tokens remain in the native auth store. */
+  startCodexLogin(): Promise<import('./api.js').CodexLoginStart>
+  /** Polls a pending Codex OAuth device flow. Returns null while authorization is pending. */
+  pollCodexLogin(deviceCode: string): Promise<import('./api.js').CodexAccount | null>
+  /** Returns Codex OAuth status and credential-free account summaries. */
+  codexAuthStatus(): Promise<import('./api.js').CodexAuthStatus>
+  /** Lists Codex OAuth accounts without exposing access or refresh tokens. */
+  listCodexAccounts(): Promise<Array<import('./api.js').CodexAccount>>
+  /** Selects the default Codex OAuth account. */
+  setDefaultCodexAccount(accountId: string): Promise<void>
+  /** Removes one Codex OAuth account. */
+  removeCodexAccount(accountId: string): Promise<void>
+  /** Clears Codex OAuth accounts and native credentials. */
+  logoutCodex(): Promise<void>
   /** Returns applications that support MCP projection. */
   supportedMcpApps(): Array<import('./api.js').McpAppId>
   /** Lists the unified MCP server registry keyed by server id. */

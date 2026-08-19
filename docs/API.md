@@ -85,6 +85,29 @@ Reads the application's live provider settings without mutating them.
 
 Synchronizes the current stored provider state back to live app configs.
 
+## Codex OAuth
+
+See [Codex OAuth login](CODEX-LOGIN.md) for the complete device-code flow.
+`startCodexLogin()` and polling are asynchronous; tokens remain in the native
+store.
+
+### `startCodexLogin(): Promise<CodexLoginStart>`
+
+Starts login and returns the verification URI, user code, device code, expiry,
+and polling interval.
+
+### `pollCodexLogin(deviceCode): Promise<CodexAccount | null>`
+
+Polls the device flow and returns `null` while authorization is pending.
+
+### `codexAuthStatus()`, `listCodexAccounts()`
+
+Read credential-free authentication and account summaries.
+
+### `setDefaultCodexAccount(accountId)`, `removeCodexAccount(accountId)`, `logoutCodex()`
+
+Manage the local Codex OAuth account store.
+
 ## Common configuration
 
 ### `extractCommonConfig(app): string`

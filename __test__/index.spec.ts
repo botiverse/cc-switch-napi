@@ -209,6 +209,27 @@ test.serial('runs network-backed Skill APIs on the native async runtime', async 
   })
 })
 
+test.serial('exposes credential-free Codex OAuth account management', async (t) => {
+  const status = await client.codexAuthStatus()
+  t.is(status.provider, 'codex_oauth')
+  t.false(status.authenticated)
+  t.deepEqual(status.accounts, [])
+  t.false('accessToken' in status)
+  t.false('refreshToken' in status)
+  t.deepEqual(await client.listCodexAccounts(), [])
+
+  const pollError = await t.throwsAsync(() => client.pollCodexLogin('  '))
+  t.is((pollError as { code?: string }).code, 'InvalidArg')
+  t.regex(pollError.message, /deviceCode must not be empty/)
+  await t.throwsAsync(() => client.setDefaultCodexAccount(''), {
+    message: /accountId must not be empty/,
+  })
+  await t.throwsAsync(() => client.removeCodexAccount(''), {
+    message: /accountId must not be empty/,
+  })
+  await client.logoutCodex()
+})
+
 test.serial('releases the store and instance slot explicitly', (t) => {
   client.close()
   t.throws(() => client.listProviders('claude'), {

@@ -6,8 +6,8 @@ use std::{
 };
 
 use cc_switch_lib::{
-  AppState, AppType, ImportSkillSelection, McpApps, McpServer, McpService, Provider,
-  ProviderService, SkillApps, SkillService,
+  AppState, AppType, AuthService, ImportSkillSelection, ManagedAuthAccount, ManagedAuthStatus,
+  McpApps, McpServer, McpService, Provider, ProviderService, SkillApps, SkillService,
 };
 use napi::{Error, Result, Status};
 use napi_derive::napi;
@@ -55,6 +55,27 @@ fn serialize_json<T: serde::Serialize>(value: T) -> Result<Value> {
 fn count_to_u32(count: usize, label: &str) -> Result<u32> {
   u32::try_from(count)
     .map_err(|_| Error::new(Status::GenericFailure, format!("{label} count exceeds u32")))
+}
+
+fn codex_account_json(account: ManagedAuthAccount) -> Value {
+  serde_json::json!({
+    "id": account.id,
+    "provider": account.provider,
+    "login": account.login,
+    "avatarUrl": account.avatar_url,
+    "authenticatedAt": account.authenticated_at,
+    "isDefault": account.is_default,
+  })
+}
+
+fn codex_status_json(status: ManagedAuthStatus) -> Value {
+  serde_json::json!({
+    "provider": status.provider,
+    "authenticated": status.authenticated,
+    "defaultAccountId": status.default_account_id,
+    "migrationError": status.migration_error,
+    "accounts": status.accounts.into_iter().map(codex_account_json).collect::<Vec<_>>(),
+  })
 }
 
 /// Stateful access to CC Switch provider storage and live configuration.
@@ -314,6 +335,103 @@ impl CcSwitch {
   #[napi]
   pub fn sync_current_to_live(&self) -> Result<()> {
     ProviderService::sync_current_to_live(self.state()?).map_err(napi_error)
+  }
+
+  /// Starts the Codex OAuth device flow. Tokens remain in the native auth store.
+  #[napi(ts_return_type = "Promise<import('./api.js').CodexLoginStart>")]
+  pub async fn start_codex_login(&self) -> Result<Value> {
+    self.state()?;
+    let response = AuthService::start_login("codex_oauth")
+      .await
+      .map_err(napi_error)?;
+    Ok(serde_json::json!({
+      "provider": response.provider,
+      "deviceCode": response.device_code,
+      "userCode": response.user_code,
+      "verificationUri": response.verification_uri,
+      "expiresIn": response.expires_in,
+      "interval": response.interval,
+    }))
+  }
+
+  /// Polls a pending Codex OAuth device flow. Returns null while authorization is pending.
+  #[napi(ts_return_type = "Promise<import('./api.js').CodexAccount | null>")]
+  pub async fn poll_codex_login(&self, device_code: String) -> Result<Option<Value>> {
+    self.state()?;
+    let device_code = device_code.trim();
+    if device_code.is_empty() {
+      return Err(Error::new(
+        Status::InvalidArg,
+        "deviceCode must not be empty",
+      ));
+    }
+    let account = AuthService::poll_for_account("codex_oauth", device_code)
+      .await
+      .map_err(napi_error)?
+      .map(codex_account_json);
+    Ok(account)
+  }
+
+  /// Returns Codex OAuth status and credential-free account summaries.
+  #[napi(ts_return_type = "Promise<import('./api.js').CodexAuthStatus>")]
+  pub async fn codex_auth_status(&self) -> Result<Value> {
+    self.state()?;
+    let status = AuthService::get_status("codex_oauth")
+      .await
+      .map_err(napi_error)?;
+    Ok(codex_status_json(status))
+  }
+
+  /// Lists Codex OAuth accounts without exposing access or refresh tokens.
+  #[napi(ts_return_type = "Promise<Array<import('./api.js').CodexAccount>>")]
+  pub async fn list_codex_accounts(&self) -> Result<Vec<Value>> {
+    self.state()?;
+    let accounts = AuthService::list_accounts("codex_oauth")
+      .await
+      .map_err(napi_error)?
+      .into_iter()
+      .map(codex_account_json)
+      .collect();
+    Ok(accounts)
+  }
+
+  /// Selects the default Codex OAuth account.
+  #[napi]
+  pub async fn set_default_codex_account(&self, account_id: String) -> Result<()> {
+    self.state()?;
+    let account_id = account_id.trim();
+    if account_id.is_empty() {
+      return Err(Error::new(
+        Status::InvalidArg,
+        "accountId must not be empty",
+      ));
+    }
+    AuthService::set_default_account("codex_oauth", account_id)
+      .await
+      .map_err(napi_error)
+  }
+
+  /// Removes one Codex OAuth account.
+  #[napi]
+  pub async fn remove_codex_account(&self, account_id: String) -> Result<()> {
+    self.state()?;
+    let account_id = account_id.trim();
+    if account_id.is_empty() {
+      return Err(Error::new(
+        Status::InvalidArg,
+        "accountId must not be empty",
+      ));
+    }
+    AuthService::remove_account("codex_oauth", account_id)
+      .await
+      .map_err(napi_error)
+  }
+
+  /// Clears Codex OAuth accounts and native credentials.
+  #[napi]
+  pub async fn logout_codex(&self) -> Result<()> {
+    self.state()?;
+    AuthService::logout("codex_oauth").await.map_err(napi_error)
   }
 
   /// Returns applications that support MCP projection.

@@ -36,6 +36,7 @@ try {
 
 See [API reference](docs/API.md) for every method and
 [binding coverage](docs/COVERAGE.md) for the exact upstream boundary.
+For interactive Codex device-code login, see [Codex OAuth login](docs/CODEX-LOGIN.md).
 
 ## Supported applications
 

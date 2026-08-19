@@ -55,6 +55,34 @@ export interface Provider {
 export type McpAppId = Exclude<AppId, 'openclaw'>
 export type SkillAppId = Exclude<AppId, 'openclaw'>
 
+/** Device-code handoff returned by Codex OAuth login. No token is exposed. */
+export interface CodexLoginStart {
+  provider: 'codex_oauth'
+  deviceCode: string
+  userCode: string
+  verificationUri: string
+  expiresIn: number
+  interval: number
+}
+
+/** Credential-free summary of a locally stored Codex OAuth account. */
+export interface CodexAccount {
+  id: string
+  provider: 'codex_oauth'
+  login: string
+  avatarUrl?: string | null
+  authenticatedAt: number
+  isDefault: boolean
+}
+
+export interface CodexAuthStatus {
+  provider: 'codex_oauth'
+  authenticated: boolean
+  defaultAccountId?: string | null
+  migrationError?: string | null
+  accounts: CodexAccount[]
+}
+
 export interface McpApps {
   claude?: boolean
   codex?: boolean
