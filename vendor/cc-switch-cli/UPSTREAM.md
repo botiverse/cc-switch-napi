@@ -2,7 +2,7 @@
 
 - Project: `botiverse/cc-switch-cli`
 - Source: <https://github.com/botiverse/cc-switch-cli>
-- Revision: `53f21f30051897b5d1aa3e637f34c92cf826fca4`
+- Revision: `bc1d30abcab371f74373cca20bc2ceffa36563f4`
 - Upstream PR: <https://github.com/SaladDay/cc-switch-cli/pull/421>
 - License: MIT; see `LICENSE` in this directory.
 - Vendored path: `src-tauri/`, consumed as the Cargo path dependency
