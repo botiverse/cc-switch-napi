@@ -13,7 +13,7 @@ version      = "0.2.0"
 crate-type = ["cdylib"]
 
 [dependencies]
-cc-switch   = { path = "vendor/cc-switch-cli/src-tauri" }
+cc-switch   = { path = "vendor/cc-switch-cli/src-tauri", default-features = false }
 napi        = { version = "3.0.0", features = ["serde-json", "tokio_rt"] }
 napi-derive = "3.0.0"
 serde       = { version = "1", features = ["derive"] }
