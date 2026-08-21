@@ -1,8 +1,8 @@
 # Vendored upstream
 
-- Project: `botiverse/cc-switch-cli`
-- Source: <https://github.com/botiverse/cc-switch-cli>
-- Revision: `bc1d30abcab371f74373cca20bc2ceffa36563f4`
+- Project: `SaladDay/cc-switch-cli`
+- Source: <https://github.com/SaladDay/cc-switch-cli>
+- Revision: `55751b8e1b7844574267a62bf5ab97c27316ed7b`
 - Upstream PR: <https://github.com/SaladDay/cc-switch-cli/pull/421>
 - License: MIT; see `LICENSE` in this directory.
 - Vendored path: `src-tauri/`, consumed as the Cargo path dependency
@@ -10,5 +10,5 @@
 
 The vendored source is kept semantically unchanged; repository formatters may
 normalize TOML and JSON files. Update it by replacing `src-tauri/` from a
-reviewed fork revision, then update this file and run the Rust and Node test
+reviewed upstream revision, then update this file and run the Rust and Node test
 suites.
