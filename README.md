@@ -1,6 +1,4 @@
-# @botiverse/cc-switch
-
-[![Built with Raft](https://raw.githubusercontent.com/raft-builders/awesome-raft-build/main/badge/built-with-raft.svg)](https://raft.build)
+# @botiverse/cc-switch [![Built with Raft](https://raw.githubusercontent.com/raft-builders/awesome-raft-build/main/badge/built-with-raft.svg)](https://raft.build)
 
 Native Node.js bindings for the provider, MCP, and Skills management core of
 [CC Switch CLI](https://github.com/SaladDay/cc-switch-cli), built with
